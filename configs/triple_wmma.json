@@ -1,0 +1,9 @@
+{
+  "engine": "wmma",
+  "layout": "dense",
+  "functions": "sin,cos,tan",
+  "terms": 5,
+  "n": 10000000,
+  "iterations": 50,
+  "threshold": 1e-5
+}

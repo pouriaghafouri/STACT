@@ -1,0 +1,9 @@
+{
+  "engine": "cusparselt",
+  "layout": "sparse24",
+  "functions": "sin,cos,tan",
+  "terms": 5,
+  "n": 10000000,
+  "iterations": 50,
+  "threshold": 1e-3
+}

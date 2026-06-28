@@ -1,0 +1,322 @@
+#include "tact/common.cuh"
+
+namespace tact {
+
+const char* functionName(FunctionId f) {
+  switch (f) {
+    case F_EXP: return "exp";
+    case F_LOG1P: return "ln1p";
+    case F_SIN: return "sin";
+    case F_COS: return "cos";
+    case F_TAN: return "tan";
+    case F_SINH: return "sinh";
+    case F_COSH: return "cosh";
+    case F_TANH: return "tanh";
+  }
+  return "unknown";
+}
+
+std::string functionListName(const std::vector<FunctionId>& fs) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < fs.size(); ++i) {
+    if (i) oss << "+";
+    oss << functionName(fs[i]);
+  }
+  return oss.str();
+}
+
+std::string engineName(EngineKind e) {
+  switch (e) {
+    case ENGINE_BASELINE_FAST: return "baseline_fast";
+    case ENGINE_BASELINE_SP: return "baseline_sp";
+    case ENGINE_WMMA: return "wmma";
+    case ENGINE_CUSPARSE: return "cusparse";
+    case ENGINE_CUSPARSELT: return "cusparselt";
+  }
+  return "unknown";
+}
+
+std::string layoutName(LayoutKind l) {
+  return l == LAYOUT_DENSE ? "dense" : "sparse24";
+}
+
+static std::string lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+  return s;
+}
+
+static std::vector<std::string> split(const std::string& s, char delim) {
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, delim)) {
+    if (!item.empty()) out.push_back(item);
+  }
+  return out;
+}
+
+FunctionId parseFunction(const std::string& raw) {
+  std::string s = lower(raw);
+  if (s == "exp" || s == "exponential" || s == "xponential") return F_EXP;
+  if (s == "ln" || s == "log" || s == "log1p" || s == "ln1p" || s == "ln(x+1)") return F_LOG1P;
+  if (s == "sin" || s == "sine") return F_SIN;
+  if (s == "cos" || s == "cosine") return F_COS;
+  if (s == "tan" || s == "tangent") return F_TAN;
+  if (s == "sinh") return F_SINH;
+  if (s == "cosh") return F_COSH;
+  if (s == "tanh") return F_TANH;
+  throw std::runtime_error("Unknown function: " + raw);
+}
+
+EngineKind parseEngine(const std::string& raw) {
+  std::string s = lower(raw);
+  if (s == "baseline" || s == "baseline_fast" || s == "sfu" || s == "fast") return ENGINE_BASELINE_FAST;
+  if (s == "sp" || s == "baseline_sp" || s == "libdevice") return ENGINE_BASELINE_SP;
+  if (s == "wmma" || s == "tensor" || s == "dense") return ENGINE_WMMA;
+  if (s == "cusparse") return ENGINE_CUSPARSE;
+  if (s == "cusparselt" || s == "sparselt") return ENGINE_CUSPARSELT;
+  throw std::runtime_error("Unknown engine: " + raw);
+}
+
+LayoutKind parseLayout(const std::string& raw) {
+  std::string s = lower(raw);
+  if (s == "dense" || s == "sequential" || s == "normal") return LAYOUT_DENSE;
+  if (s == "sparse24" || s == "2:4" || s == "24" || s == "cusparselt") return LAYOUT_SPARSE24;
+  throw std::runtime_error("Unknown layout: " + raw);
+}
+
+bool isEvenGroup(FunctionId f) {
+  return f == F_SIN || f == F_COS || f == F_TAN || f == F_SINH || f == F_COSH || f == F_TANH;
+}
+
+bool isMixedGroup(FunctionId f) {
+  return f == F_EXP || f == F_LOG1P;
+}
+
+BasisKind determineBasis(const std::vector<FunctionId>& funcs) {
+  bool all_even = std::all_of(funcs.begin(), funcs.end(), isEvenGroup);
+  bool all_mixed = std::all_of(funcs.begin(), funcs.end(), isMixedGroup);
+  if (all_even) return BASIS_EVEN;
+  if (all_mixed) return BASIS_MIXED;
+  throw std::runtime_error("Requested functions are not compatible for one shared Tile A. Use only {sin,cos,tan,sinh,cosh,tanh} or only {exp,ln1p}.");
+}
+
+int inputsPerRow(int terms, int num_funcs) {
+  if (terms < 1 || terms > 8) {
+    throw std::runtime_error("terms must be in [1,8]. K=16 and 2:4 supports at most 8 nonzeros per logical output column.");
+  }
+  int by_k = WMMA_K / terms;
+  int by_n = WMMA_N / num_funcs;
+  int ipr = std::min(by_k, by_n);
+  if (ipr < 1) throw std::runtime_error("Invalid terms/function count: no input can be packed into a 16x16 MMA tile.");
+  return ipr;
+}
+
+int roundUp(int x, int a) { return ((x + a - 1) / a) * a; }
+
+std::vector<int> makePositions(int terms, int ipr, LayoutKind layout) {
+  if (terms * ipr > WMMA_K) throw std::runtime_error("terms * inputs_per_row exceeds K=16");
+  std::vector<int> pos(ipr * terms, -1);
+  if (layout == LAYOUT_DENSE) {
+    for (int s = 0; s < ipr; ++s) {
+      for (int t = 0; t < terms; ++t) pos[s * terms + t] = s * terms + t;
+    }
+    return pos;
+  }
+
+  // Deterministic 2:4-friendly K permutation. Each logical output column (one
+  // input slot) may have at most two nonzeros in every contiguous group of four
+  // K entries. We offset the group sequence per slot so extra terms are spread
+  // across the four 2:4 groups rather than overloading group 0.
+  int next_in_group[4] = {0, 0, 0, 0};
+  int per_slot_group[64] = {0};  // ipr <= 16, four groups per slot.
+  for (int s = 0; s < ipr; ++s) {
+    for (int t = 0; t < terms; ++t) {
+      int chosen = -1;
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        int g = (s + t + attempt) & 3;
+        if (per_slot_group[s * 4 + g] >= 2) continue;
+        if (next_in_group[g] >= 4) continue;
+        chosen = g;
+        break;
+      }
+      if (chosen < 0) {
+        throw std::runtime_error("Could not build a 2:4-valid K layout for this terms/input packing.");
+      }
+      int k = chosen * 4 + next_in_group[chosen]++;
+      per_slot_group[s * 4 + chosen]++;
+      pos[s * terms + t] = k;
+    }
+  }
+  checkSparse24(pos, terms, ipr);
+  return pos;
+}
+
+void checkSparse24(const std::vector<int>& pos, int terms, int ipr) {
+  for (int s = 0; s < ipr; ++s) {
+    int counts[4] = {0,0,0,0};
+    for (int t = 0; t < terms; ++t) {
+      int k = pos[s * terms + t];
+      if (k < 0 || k >= 16) throw std::runtime_error("invalid K position");
+      counts[k / 4]++;
+    }
+    for (int g = 0; g < 4; ++g) {
+      if (counts[g] > 2) throw std::runtime_error("2:4 violation in generated layout");
+    }
+  }
+}
+
+ProblemSpec makeProblemSpec(const Options& opt) {
+  ProblemSpec spec;
+  spec.basis = determineBasis(opt.funcs);
+  spec.num_funcs = int(opt.funcs.size());
+  spec.ipr = inputsPerRow(opt.terms, spec.num_funcs);
+  spec.positions = makePositions(opt.terms, spec.ipr, opt.layout);
+  if (opt.layout == LAYOUT_SPARSE24) checkSparse24(spec.positions, opt.terms, spec.ipr);
+  return spec;
+}
+
+void printProblemSpec(const ProblemSpec& spec, const Options& opt) {
+  std::cerr << "Basis: " << (spec.basis == BASIS_EVEN ? "even" : "mixed") << "\n";
+  std::cerr << "Inputs per Tile-A row: " << spec.ipr << "\n";
+  for (int s = 0; s < spec.ipr; ++s) {
+    std::cerr << "slot " << s << ":";
+    for (int t = 0; t < opt.terms; ++t) std::cerr << " k" << spec.positions[s * opt.terms + t];
+    std::cerr << "\n";
+  }
+}
+
+static bool containsFunction(const std::vector<FunctionId>& fs, FunctionId target) {
+  return std::find(fs.begin(), fs.end(), target) != fs.end();
+}
+
+std::vector<float> makeInputs(const Options& opt, BasisKind basis) {
+  float xmin = opt.xmin, xmax = opt.xmax;
+  if (!opt.min_set || !opt.max_set) {
+    // These defaults are intentionally validation-safe for the truncated Taylor
+    // series and FP16 Tensor-Core inputs used by the TACT engines. A wider range,
+    // especially for tan/tanh close to pi/2, is a stress test and should be
+    // requested explicitly with --min/--max and/or a looser threshold.
+    if (basis == BASIS_EVEN) {
+      if (containsFunction(opt.funcs, F_TAN) || containsFunction(opt.funcs, F_TANH)) {
+        xmin = -0.5f;
+        xmax =  0.5f;
+      } else {
+        xmin = -1.25f;
+        xmax =  1.25f;
+      }
+    } else {
+      // log1p Taylor is slow to converge for large |x|; keep the default small
+      // so --threshold 1e-5 is meaningful for the default --terms 5.
+      xmin = -0.1f;
+      xmax =  0.1f;
+    }
+  }
+  std::mt19937_64 rng(opt.seed);
+  std::uniform_real_distribution<float> dist(xmin, xmax);
+  std::vector<float> h(opt.n);
+  for (int i = 0; i < opt.n; ++i) h[i] = dist(rng);
+  return h;
+}
+
+RunResult computeValidation(const std::vector<float>& out,
+                            const std::vector<float>& ref,
+                            int n,
+                            int num_funcs,
+                            float threshold) {
+  RunResult r;
+  r.func_max_abs.assign(num_funcs, 0.0);
+  r.func_max_rel.assign(num_funcs, 0.0);
+  r.func_failures.assign(num_funcs, 0);
+  for (int f = 0; f < num_funcs; ++f) {
+    for (int i = 0; i < n; ++i) {
+      double a = out[size_t(f) * n + i];
+      double b = ref[size_t(f) * n + i];
+      if (std::isnan(a) && std::isnan(b)) continue;
+      if (std::isinf(a) && std::isinf(b) && std::signbit(a) == std::signbit(b)) continue;
+      if (!std::isfinite(a) || !std::isfinite(b)) {
+        r.failures++;
+        r.func_failures[f]++;
+        continue;
+      }
+      double abs_err = std::abs(a - b);
+      double rel_err = abs_err / std::max(1e-12, std::abs(b));
+      r.max_abs = std::max(r.max_abs, abs_err);
+      r.max_rel = std::max(r.max_rel, rel_err);
+      r.func_max_abs[f] = std::max(r.func_max_abs[f], abs_err);
+      r.func_max_rel[f] = std::max(r.func_max_rel[f], rel_err);
+      if (!(abs_err <= threshold || rel_err <= threshold)) {
+        r.failures++;
+        r.func_failures[f]++;
+      }
+    }
+  }
+  return r;
+}
+
+Options parseArgs(int argc, char** argv) {
+  Options opt;
+  auto need = [&](int& i) -> std::string {
+    if (i + 1 >= argc) throw std::runtime_error(std::string("Missing value for ") + argv[i]);
+    return argv[++i];
+  };
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--engine") opt.engine = parseEngine(need(i));
+    else if (a == "--layout") opt.layout = parseLayout(need(i));
+    else if (a == "--functions" || a == "--funcs") {
+      opt.funcs.clear();
+      for (const auto& s : split(need(i), ',')) opt.funcs.push_back(parseFunction(s));
+    } else if (a == "--terms") opt.terms = std::stoi(need(i));
+    else if (a == "--n") opt.n = std::stoi(need(i));
+    else if (a == "--warmup") opt.warmup = std::stoi(need(i));
+    else if (a == "--iterations" || a == "--iters") opt.iterations = std::stoi(need(i));
+    else if (a == "--inner-repeat" || a == "--repeat") opt.inner_repeat = std::stoi(need(i));
+    else if (a == "--threshold") opt.threshold = std::stof(need(i));
+    else if (a == "--seed") opt.seed = std::stoull(need(i));
+    else if (a == "--min") { opt.xmin = std::stof(need(i)); opt.min_set = true; }
+    else if (a == "--max") { opt.xmax = std::stof(need(i)); opt.max_set = true; }
+    else if (a == "--csv") opt.csv_path = need(i);
+    else if (a == "--no-validate") opt.validate = false;
+    else if (a == "--profile-sections") opt.profile_sections = true;
+    else if (a == "--no-profile-sections") opt.profile_sections = false;
+    else if (a == "--print-layout") opt.print_layout = true;
+    else if (a == "--help" || a == "-h") {
+      std::cout <<
+        "TACT benchmark\n"
+        "  --engine baseline_fast|baseline_sp|wmma|cusparse|cusparselt\n"
+        "  --functions sin,cos,tan | exp,ln1p | compatible single/dual/triple sets\n"
+        "  --terms <1..8> --layout dense|sparse24\n"
+        "  --n <count> --warmup <k> --iterations <k> --inner-repeat <k>\n"
+        "  --threshold <eps> --min <x> --max <x> --csv results.csv --print-layout\n"
+        "  --profile-sections | --no-profile-sections\n";
+      std::exit(0);
+    } else {
+      throw std::runtime_error("Unknown option: " + a);
+    }
+  }
+  if (opt.funcs.empty() || opt.funcs.size() > MAX_FUNCS) throw std::runtime_error("Use 1, 2, or 3 functions.");
+  if ((opt.min_set && !opt.max_set) || (!opt.min_set && opt.max_set)) throw std::runtime_error("Set both --min and --max or neither.");
+  if (opt.min_set && !(opt.xmin < opt.xmax)) throw std::runtime_error("--min must be less than --max.");
+  if (opt.n <= 0 || opt.warmup < 0 || opt.iterations <= 0 || opt.inner_repeat <= 0) throw std::runtime_error("Invalid n/warmup/iterations/inner-repeat.");
+  return opt;
+}
+
+void appendCsv(const std::string& path, const Options& opt, const RunResult& r) {
+  bool exists = false;
+  { std::ifstream f(path); exists = f.good(); }
+  std::ofstream out(path, std::ios::app);
+  if (!exists) {
+    out << "engine,layout,functions,terms,n,warmup,iterations,inner_repeat,timed_values_per_iteration,timed_outputs_per_iteration,init_ms,avg_ms,min_ms,max_ms,avg_baseline_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,avg_postprocess_ms,throughput_mvalues_s,max_abs,max_rel,failures,threshold\n";
+  }
+  out << engineName(opt.engine) << ','
+      << layoutName(opt.layout) << ','
+      << functionListName(opt.funcs) << ','
+      << opt.terms << ',' << opt.n << ',' << opt.warmup << ',' << opt.iterations << ',' << opt.inner_repeat << ','
+      << std::setprecision(12) << r.timed_values << ',' << r.timed_outputs << ','
+      << std::setprecision(8) << r.init_ms << ',' << r.avg_ms << ',' << r.min_ms << ',' << r.max_ms << ','
+      << r.avg_baseline_ms << ',' << r.avg_fused_kernel_ms << ',' << r.avg_build_power_ms << ',' << r.avg_matmul_ms << ',' << r.avg_postprocess_ms << ','
+      << r.throughput_mvals_s << ',' << r.max_abs << ',' << r.max_rel << ',' << r.failures << ',' << opt.threshold << "\n";
+}
+
+}  // namespace tact
