@@ -42,10 +42,7 @@ RunResult runBenchmark(const Options& opt) {
   ref_engine->run();
   TACT_CUDA_CHECK(cudaDeviceSynchronize());
 
-  auto init_start = std::chrono::high_resolution_clock::now();
   auto engine = makeSelectedEngine(opt, ctx);
-  TACT_CUDA_CHECK(cudaDeviceSynchronize());
-  auto init_stop = std::chrono::high_resolution_clock::now();
 
   GpuTimer timer;
   std::vector<float> times;
@@ -84,7 +81,6 @@ RunResult runBenchmark(const Options& opt) {
   TACT_CUDA_CHECK(cudaDeviceSynchronize());
 
   RunResult result;
-  result.init_ms = std::chrono::duration<float, std::milli>(init_stop - init_start).count();
   result.avg_ms = std::accumulate(times.begin(), times.end(), 0.0f) / float(times.size());
   result.min_ms = *std::min_element(times.begin(), times.end());
   result.max_ms = *std::max_element(times.begin(), times.end());
