@@ -27,7 +27,7 @@ target_link_libraries(tact_bench PRIVATE CUDA::cudart CUDA::cusparse)
 
 target_compile_options(tact_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --use_fast_math -lineinfo>
-  $<$<COMPILE_LANGUAGE:CXX>:-O3>
+  $<$<COMPILE_LANGUAGE:CXX>:-O0>
 )
 
 set_target_properties(tact_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
