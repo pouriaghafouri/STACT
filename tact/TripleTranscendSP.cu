@@ -28,8 +28,8 @@ __global__ void kernel(float *d_D, float *d_sin_list, float *d_tan_list) {
     if (idx < M) {
         for (int j = 0; j < 2000; j++) {
             d_sin_list[idx] = sinf(d_D[idx] + j);
-            d_tan_list[idx] = tanf(d_D[idx] + j);
             d_D[idx] = cosf(d_D[idx] + j);
+            d_tan_list[idx] = tanf(d_D[idx] + j);
         }
     }
 }
@@ -40,9 +40,7 @@ void matmul_inner_product(float *D, float *sin_list, float *tan_list) {
     tic[0] = dtime_usec(0);
 
     size_t D_size = (size_t)M * sizeof(float);
-    float *d_D;
-    float *d_sin_list = (float*)malloc(D_size);
-    float *d_tan_list = (float*)malloc(D_size);
+    float *d_D, *d_sin_list, *d_tan_list;
 
     cudaMalloc((float**)&d_D, D_size);
     cudaMalloc((float**)&d_sin_list, D_size);

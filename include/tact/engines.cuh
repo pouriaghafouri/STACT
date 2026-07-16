@@ -26,6 +26,10 @@ class Engine {
     st.total_ms = t.toc(stream);
     return st;
   }
+  // Sparse engines may expose C^T for small debug runs. The leading dimension
+  // is returned so runner-side logical C can be compared without knowing the
+  // engine's private storage layout.
+  virtual bool copyIntermediate(std::vector<float>&, int&) { return false; }
 };
 
 std::unique_ptr<Engine> makeSfuEngine(const EngineContext& ctx);

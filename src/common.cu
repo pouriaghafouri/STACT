@@ -70,8 +70,8 @@ FunctionId parseFunction(const std::string& raw) {
 
 EngineKind parseEngine(const std::string& raw) {
   std::string s = lower(raw);
-  if (s == "sfu" || s == "fast") return ENGINE_SFU;
-  if (s == "sp" || s == "libdevice") return ENGINE_SP;
+  if (s == "sfu" || s == "fast" || s == "baseline_fast") return ENGINE_SFU;
+  if (s == "sp" || s == "libdevice" || s == "baseline_sp") return ENGINE_SP;
   if (s == "wmma" || s == "tensor" || s == "dense") return ENGINE_WMMA;
   if (s == "cusparse") return ENGINE_CUSPARSE;
   if (s == "cusparselt" || s == "sparselt") return ENGINE_CUSPARSELT;
@@ -94,23 +94,10 @@ bool isMixedGroup(FunctionId f) {
 }
 
 bool isSfuSupported(FunctionId f) {
-  switch (f) {
-    case F_EXP:    // __expf
-    case F_LOG1P:  // __logf(1+x)
-    case F_SIN:    // __sinf
-    case F_COS:    // __cosf
-    case F_TAN:    // __tanf
-      return true;
-    case F_SINH:
-    case F_COSH:
-    case F_TANH:
-      return false;
-  }
-  return false;
-}
-
-bool allSfuSupported(const std::vector<FunctionId>& funcs) {
-  return std::all_of(funcs.begin(), funcs.end(), isSfuSupported);
+  // Deliberately conservative: only the three intrinsics used by the old
+  // TACT SFU reference programs are classified as SFU in this project.
+  // exp/log/hyperbolic functions are not silently relabeled as SFU baselines.
+  return f == F_SIN || f == F_COS || f == F_TAN;
 }
 
 BasisKind determineBasis(const std::vector<FunctionId>& funcs) {
@@ -243,7 +230,10 @@ static bool containsFunction(const std::vector<FunctionId>& fs, FunctionId targe
 }
 
 std::vector<float> makeInputs(const Options& opt, BasisKind basis) {
-  if (opt.tact_mode) {
+  // With no explicit interval, reproduce each old standalone program's host
+  // initialization. A supplied --min/--max overrides it so a multi-engine
+  // sweep can feed every method the identical input distribution.
+  if (!opt.min_set && !opt.max_set) {
     std::vector<float> h(opt.n);
     bool matrix_engine = opt.engine == ENGINE_WMMA ||
                          opt.engine == ENGINE_CUSPARSE ||
@@ -325,43 +315,35 @@ RunResult computeValidation(const std::vector<float>& out,
 
 Options parseArgs(int argc, char** argv) {
   Options opt;
-  bool terms_set = false;
-  bool mode_set = false;
-  bool validate_set = false;
   auto need = [&](int& i) -> std::string {
-    if (i + 1 >= argc) throw std::runtime_error(std::string("Missing value for ") + argv[i]);
+    if (i + 1 >= argc) {
+      throw std::runtime_error(std::string("Missing value for ") + argv[i]);
+    }
     return argv[++i];
   };
+
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--engine") opt.engine = parseEngine(need(i));
     else if (a == "--layout") opt.layout = parseLayout(need(i));
     else if (a == "--functions" || a == "--funcs") {
       opt.funcs.clear();
-      for (const auto& s : split(need(i), ',')) opt.funcs.push_back(parseFunction(s));
-    } else if (a == "--terms") { opt.terms = std::stoi(need(i)); terms_set = true; }
+      for (const auto& item : split(need(i), ',')) {
+        opt.funcs.push_back(parseFunction(item));
+      }
+    } else if (a == "--terms") opt.terms = std::stoi(need(i));
     else if (a == "--n") opt.n = std::stoi(need(i));
     else if (a == "--warmup") opt.warmup = std::stoi(need(i));
     else if (a == "--iterations" || a == "--iters") opt.iterations = std::stoi(need(i));
-    else if (a == "--inner-repeat" || a == "--repeat") opt.inner_repeat = std::stoi(need(i));
-    else if (a == "--tact") {
-      opt.tact_mode = true;
-      mode_set = true;
-    }
-    else if (a == "--clean" || a == "--clean-math") {
-      opt.tact_mode = false;
-      mode_set = true;
-    }
-    else if (a == "--steps" || a == "--tact-steps") {
-      opt.tact_steps = std::stoi(need(i));
-    }
-    else if (a == "--threshold") opt.threshold = std::stof(need(i));
+    else if (a == "--stress-repeat") {
+      opt.stress_repeat = std::stoi(need(i));
+    } else if (a == "--threshold") opt.threshold = std::stof(need(i));
     else if (a == "--seed") opt.seed = std::stoull(need(i));
     else if (a == "--min") { opt.xmin = std::stof(need(i)); opt.min_set = true; }
     else if (a == "--max") { opt.xmax = std::stof(need(i)); opt.max_set = true; }
     else if (a == "--csv") opt.csv_path = need(i);
-    else if (a == "--validate") { opt.validate = true; validate_set = true; }
-    else if (a == "--no-validate") { opt.validate = false; validate_set = true; }
+    else if (a == "--validate") opt.validate = true;
+    else if (a == "--no-validate") opt.validate = false;
     else if (a == "--profile-sections") opt.profile_sections = true;
     else if (a == "--no-profile-sections") opt.profile_sections = false;
     else if (a == "--print-layout") opt.print_layout = true;
@@ -369,60 +351,77 @@ Options parseArgs(int argc, char** argv) {
     else if (a == "--debug-values") { opt.debug = true; opt.debug_values = std::stoi(need(i)); }
     else if (a == "--debug-rows") { opt.debug = true; opt.debug_rows = std::stoi(need(i)); }
     else if (a == "--debug-file") { opt.debug = true; opt.debug_file = need(i); }
-    else if (a == "--help" || a == "-h") {
+    else if (a == "--clean" || a == "--clean-math" || a == "--stress" || a == "--tact") {
+      throw std::runtime_error(
+          "This project has one execution model only: the original TACT stress "
+          "workload. Remove --clean/--stress/--tact; use --stress-repeat to set "
+          "the loop count (default 2000).");
+    } else if (a == "--inner-repeat" || a == "--repeat") {
+      throw std::runtime_error(
+          "--inner-repeat was removed because it repeats the whole engine, not "
+          "only the TACT core operation. Use --iterations for benchmark samples.");
+    } else if (a == "--help" || a == "-h") {
       std::cout <<
-        "TACT benchmark\n"
+        "TACT benchmark (original stress workload only)\n"
         "  --engine sfu|sp|wmma|cusparse|cusparselt\n"
-        "  --functions sin,cos,tan | exp,ln1p | compatible 1..4-function sets\n"
+        "  --functions cos | sin,cos | sin,cos,tan | sin,cos,tan,sinh\n"
         "  --terms <1..8> --layout dense|sparse24\n"
-        "  --n <count> --warmup <k> --iterations <k> --inner-repeat <k>\n"
-        "  --threshold <eps> --min <x> --max <x> --csv results.csv --print-layout\n"
-        "  --profile-sections | --no-profile-sections\n"
-        "  --debug [--debug-values <k>] [--debug-rows <k>] [--debug-file <path>]\n"
-        "  --tact | --clean  (TACT stress workload or one-pass math)\n"
-        "  --steps <k> --validate | --no-validate\n";
+        "  --n <count> --warmup <k> --iterations <k>\n"
+        "  --stress-repeat <k>  (default 2000; core operation only)\n"
+        "  --threshold <eps> --min <x> --max <x> --csv results.csv\n"
+        "  --validate | --no-validate --profile-sections | --no-profile-sections\n"
+        "  --print-layout --debug [--debug-values <k>] [--debug-rows <k>]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown option: " + a);
     }
   }
-  if (opt.funcs.empty() || opt.funcs.size() > MAX_FUNCS) throw std::runtime_error("Use between 1 and 4 functions.");
+
+  if (opt.funcs.empty() || opt.funcs.size() > MAX_FUNCS) {
+    throw std::runtime_error("Use between 1 and 4 functions.");
+  }
+  if ((opt.min_set && !opt.max_set) || (!opt.min_set && opt.max_set)) {
+    throw std::runtime_error("Set both --min and --max or neither.");
+  }
+  if (opt.min_set && !(opt.xmin < opt.xmax)) {
+    throw std::runtime_error("--min must be less than --max.");
+  }
+  if (opt.n <= 0 || opt.warmup < 0 || opt.iterations <= 0 ||
+      opt.stress_repeat <= 0 || opt.debug_values <= 0 || opt.debug_rows <= 0) {
+    throw std::runtime_error(
+        "Invalid n/warmup/iterations/stress-repeat/debug count.");
+  }
+
+  const bool single = opt.funcs == std::vector<FunctionId>{F_COS};
+  const bool dual = opt.funcs == std::vector<FunctionId>{F_SIN, F_COS};
+  const bool triple =
+      opt.funcs == std::vector<FunctionId>{F_SIN, F_COS, F_TAN};
+  const bool quad = opt.funcs ==
+      std::vector<FunctionId>{F_SIN, F_COS, F_TAN, F_SINH};
+
   if (opt.engine == ENGINE_SFU) {
+    if (!single && !dual && !triple) {
+      throw UnsupportedError(
+          "SFU old-TACT kernels support only cos; sin,cos; or sin,cos,tan. "
+          "The quad case contains sinh and is intentionally unsupported.");
+    }
     for (FunctionId function : opt.funcs) {
       if (!isSfuSupported(function)) {
-        throw std::runtime_error(
+        throw UnsupportedError(
             std::string("SFU engine does not support function ") +
             functionName(function));
       }
     }
   }
+  if (opt.engine == ENGINE_SP && !single && !dual && !triple && !quad) {
+    throw UnsupportedError(
+        "SP old-TACT kernels support only cos; sin,cos; sin,cos,tan; or "
+        "sin,cos,tan,sinh.");
+  }
 
-  bool single_cos = opt.funcs.size() == 1 && opt.funcs[0] == F_COS;
-  bool triple = opt.funcs.size() == 3 && opt.funcs[0] == F_SIN &&
-                opt.funcs[1] == F_COS && opt.funcs[2] == F_TAN;
-  // Cosine and triple fusion are the canonical TACT stress workloads for all
-  // engines. An explicit different term count selects generalized clean mode.
-  if (!mode_set && (single_cos || triple) &&
-      (!terms_set || opt.terms == 3)) {
-    opt.tact_mode = true;
-    if (!terms_set) opt.terms = 3;
-    if (!validate_set) opt.validate = false;
-  }
-  if (opt.tact_mode && !terms_set) opt.terms = 3;
-  if ((opt.min_set && !opt.max_set) || (!opt.min_set && opt.max_set)) throw std::runtime_error("Set both --min and --max or neither.");
-  if (opt.min_set && !(opt.xmin < opt.xmax)) throw std::runtime_error("--min must be less than --max.");
-  if (opt.n <= 0 || opt.warmup < 0 || opt.iterations <= 0 || opt.inner_repeat <= 0 ||
-      opt.tact_steps <= 0 || opt.debug_values <= 0 || opt.debug_rows <= 0) {
-    throw std::runtime_error("Invalid n/warmup/iterations/repeat/debug count.");
-  }
-  if (opt.tact_mode) {
-    if (!single_cos && !triple) {
-      throw std::runtime_error("TACT stress mode supports cos or sin,cos,tan.");
-    }
-    if (opt.engine == ENGINE_WMMA && (opt.terms != 3 || opt.layout != LAYOUT_DENSE)) {
-      throw std::runtime_error("TACT WMMA mode requires --terms 3 --layout dense.");
-    }
-  }
+  // Matrix engines can accept any compatible 1..4-function set; this check
+  // also rejects mixed power bases before device allocation.
+  (void)determineBasis(opt.funcs);
   return opt;
 }
 
@@ -431,19 +430,27 @@ void appendCsv(const std::string& path, const Options& opt, const RunResult& r) 
   { std::ifstream f(path); exists = f.good(); }
   std::ofstream out(path, std::ios::app);
   if (!exists) {
-    out << "engine,layout,functions,terms,n,warmup,iterations,inner_repeat,tact_mode,tact_steps,timed_values_per_iteration,timed_outputs_per_iteration,init_ms,avg_h2d_ms,avg_kernel_ms,avg_d2h_ms,avg_ms,min_ms,max_ms,avg_scalar_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,avg_postprocess_ms,throughput_mvalues_s,max_abs,max_rel,failures,threshold\n";
+    out << "engine,layout,functions,terms,n,warmup,iterations,stress_repeat,"
+           "timed_values_per_iteration,timed_outputs_per_iteration,init_ms,"
+           "avg_h2d_ms,avg_kernel_ms,avg_d2h_ms,avg_ms,min_ms,max_ms,"
+           "avg_scalar_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,"
+           "avg_postprocess_ms,avg_profiled_ms,throughput_mvalues_s,max_abs,"
+           "max_rel,failures,threshold\n";
   }
   out << engineName(opt.engine) << ','
       << layoutName(opt.layout) << ','
       << functionListName(opt.funcs) << ','
-      << opt.terms << ',' << opt.n << ',' << opt.warmup << ',' << opt.iterations << ',' << opt.inner_repeat << ','
-      << (opt.tact_mode ? 1 : 0) << ',' << opt.tact_steps << ','
+      << opt.terms << ',' << opt.n << ',' << opt.warmup << ','
+      << opt.iterations << ',' << opt.stress_repeat << ','
       << std::setprecision(12) << r.timed_values << ',' << r.timed_outputs << ','
       << std::setprecision(8) << r.init_ms << ',' << r.avg_h2d_ms << ','
       << r.avg_kernel_ms << ',' << r.avg_d2h_ms << ',' << r.avg_ms << ','
       << r.min_ms << ',' << r.max_ms << ','
-      << r.avg_scalar_ms << ',' << r.avg_fused_kernel_ms << ',' << r.avg_build_power_ms << ',' << r.avg_matmul_ms << ',' << r.avg_postprocess_ms << ','
-      << r.throughput_mvals_s << ',' << r.max_abs << ',' << r.max_rel << ',' << r.failures << ',' << opt.threshold << "\n";
+      << r.avg_scalar_ms << ',' << r.avg_fused_kernel_ms << ','
+      << r.avg_build_power_ms << ',' << r.avg_matmul_ms << ','
+      << r.avg_postprocess_ms << ',' << r.avg_profiled_ms << ','
+      << r.throughput_mvals_s << ',' << r.max_abs << ',' << r.max_rel << ','
+      << r.failures << ',' << opt.threshold << "\n";
 }
 
 }  // namespace tact

@@ -4,6 +4,8 @@
 
 namespace tact {
 namespace {
+constexpr cusparseSpMMAlg_t kSpmmAlgorithm = CUSPARSE_SPMM_CSR_ALG2;
+
 class CuSparseEngine final : public Engine {
  public:
   explicit CuSparseEngine(EngineContext ctx) : ctx_(ctx) {
@@ -35,13 +37,13 @@ class CuSparseEngine final : public Engine {
                                             d_powerT_.as<__half>(), CUDA_R_16F, CUSPARSE_ORDER_ROW));
     TACT_CUSPARSE_CHECK(cusparseCreateDnMat(&matC_, OUT_PAD, rows_pad_, rows_pad_,
                                             d_ct_.as<float>(), CUDA_R_32F, CUSPARSE_ORDER_ROW));
-    float alpha = 1.0f, beta = 0.0f;
+    float alpha = 1.0f, beta = 1.0f;
     size_t buffer_size = 0;
     TACT_CUSPARSE_CHECK(cusparseSpMM_bufferSize(handle_,
                                                 CUSPARSE_OPERATION_NON_TRANSPOSE,
                                                 CUSPARSE_OPERATION_NON_TRANSPOSE,
                                                 &alpha, matA_, matB_, &beta, matC_,
-                                                CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
+                                                CUDA_R_32F, kSpmmAlgorithm,
                                                 &buffer_size));
     d_buffer_.allocate(buffer_size);
   }
@@ -58,18 +60,11 @@ class CuSparseEngine final : public Engine {
     launchBuildPowerT(ctx_.d_in, d_powerT_.as<__half>(), ctx_.opt->n, rows_pad_,
                       ctx_.opt->terms, ctx_.spec.ipr, ctx_.spec.basis,
                       ctx_.d_positions, stream);
-    const float alpha = ctx_.opt->tact_mode
-        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
-    const float beta = 0.0f;
-    TACT_CUSPARSE_CHECK(cusparseSpMM(handle_,
-                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                     &alpha, matA_, matB_, &beta, matC_,
-                                     CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-                                     d_buffer_.ptr));
+    launchFillFloatOnes(d_ct_.as<float>(), size_t(OUT_PAD) * rows_pad_, stream);
+    multiplyRepeated(stream);
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                     ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
-                    ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
+                    ctx_.d_output_groups, stream);
   }
 
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
@@ -82,31 +77,51 @@ class CuSparseEngine final : public Engine {
     launchBuildPowerT(ctx_.d_in, d_powerT_.as<__half>(), ctx_.opt->n, rows_pad_,
                       ctx_.opt->terms, ctx_.spec.ipr, ctx_.spec.basis,
                       ctx_.d_positions, stream);
+    launchFillFloatOnes(d_ct_.as<float>(), size_t(OUT_PAD) * rows_pad_, stream);
     st.build_power_ms += phase.toc(stream);
 
-    const float alpha = ctx_.opt->tact_mode
-        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
-    const float beta = 0.0f;
     phase.tic(stream);
-    TACT_CUSPARSE_CHECK(cusparseSpMM(handle_,
-                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                     &alpha, matA_, matB_, &beta, matC_,
-                                     CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
-                                     d_buffer_.ptr));
+    multiplyRepeated(stream);
     st.matmul_ms += phase.toc(stream);
 
     phase.tic(stream);
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                     ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
-                    ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
+                    ctx_.d_output_groups, stream);
     st.postprocess_ms += phase.toc(stream);
 
     st.total_ms = total.toc(stream);
     return st;
   }
 
+  bool copyIntermediate(std::vector<float>& values,
+                        int& leading_dimension) override {
+    values.resize(size_t(OUT_PAD) * rows_pad_);
+    TACT_CUDA_CHECK(cudaMemcpy(values.data(), d_ct_.as<float>(),
+                               values.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+    leading_dimension = rows_pad_;
+    return true;
+  }
+
  private:
+  void multiplyRepeated(cudaStream_t stream) {
+    TACT_CUSPARSE_CHECK(cusparseSetStream(handle_, stream));
+    const float alpha = 1.0f;
+    const float beta = 1.0f;
+    // Exact TACT stress semantics: C starts at one and only SpMM is repeated.
+    // Power construction and postprocessing remain outside this loop.
+    for (int repeat = 0; repeat < ctx_.opt->stress_repeat; ++repeat) {
+      TACT_CUSPARSE_CHECK(cusparseSpMM(handle_,
+                                       CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                       CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                       &alpha, matA_, matB_, &beta, matC_,
+                                       CUDA_R_32F,
+                                       kSpmmAlgorithm,
+                                       d_buffer_.ptr));
+    }
+  }
+
   EngineContext ctx_;
   int rows_ = 0;
   int rows_pad_ = 0;

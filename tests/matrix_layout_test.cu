@@ -9,6 +9,13 @@ void require(bool condition, const std::string& message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+tact::Options parseOptions(std::vector<std::string> arguments) {
+  std::vector<char*> argv;
+  argv.reserve(arguments.size());
+  for (std::string& argument : arguments) argv.push_back(argument.data());
+  return tact::parseArgs(int(argv.size()), argv.data());
+}
+
 void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
                tact::LayoutKind layout_kind) {
   tact::Options options;
@@ -79,6 +86,20 @@ void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
   require(col_ind.size() == values.size() &&
               row_ptr.back() == int(values.size()),
           "CSR nonzero metadata mismatch");
+  for (int row = 0; row < tact::OUT_PAD; ++row) {
+    float csr_dot = 0.0f;
+    float dense_dot = 0.0f;
+    for (int entry = row_ptr[row]; entry < row_ptr[row + 1]; ++entry) {
+      csr_dot += __half2float(values[entry]) *
+                 __half2float(physical_a[col_ind[entry]]);
+    }
+    for (int k = 0; k < tact::WMMA_K; ++k) {
+      dense_dot += __half2float(layout.physical[k * tact::OUT_PAD + row]) *
+                   __half2float(physical_a[k]);
+    }
+    require(csr_dot == dense_dot,
+            "CSR(B^T) product differs from the physical dense product");
+  }
 }
 
 }  // namespace
@@ -104,13 +125,56 @@ int main() {
     checkCase({F_EXP, F_LOG1P}, terms, LAYOUT_SPARSE24);
   }
 
-  require(isSfuSupported(F_EXP) && isSfuSupported(F_LOG1P) &&
-              isSfuSupported(F_SIN) && isSfuSupported(F_COS) &&
+  require(isSfuSupported(F_SIN) && isSfuSupported(F_COS) &&
               isSfuSupported(F_TAN),
-          "explicit SFU support list is incomplete");
-  require(!isSfuSupported(F_SINH) && !isSfuSupported(F_COSH) &&
+          "old-TACT SFU support list is incomplete");
+  require(!isSfuSupported(F_EXP) && !isSfuSupported(F_LOG1P) &&
+              !isSfuSupported(F_SINH) && !isSfuSupported(F_COSH) &&
               !isSfuSupported(F_TANH),
-          "SFU support list contains a standard-math fallback");
+          "SFU support list contains a non-reference fallback");
+
+  Options old_triple;
+  old_triple.funcs = {F_SIN, F_COS, F_TAN};
+  old_triple.terms = 3;
+  old_triple.layout = LAYOUT_DENSE;
+  ProblemSpec old_triple_spec = makeProblemSpec(old_triple);
+  require(old_triple_spec.ipr == 5,
+          "reference triple packing must retain five inputs per WMMA row");
+  require(old_triple_spec.output_groups == std::vector<int>({1, 0, 2}),
+          "reference triple columns must remain cos, sin, tan");
+  for (int k = 0; k < 15; ++k) {
+    require(old_triple_spec.positions[k] == k,
+            "reference triple Tile A K ordering changed");
+  }
+
+  Options stress_options = parseOptions({
+      "tact_bench", "--engine", "baseline_sp", "--functions", "sin,cos",
+      "--terms", "3", "--stress-repeat", "17"});
+  require(stress_options.engine == ENGINE_SP &&
+              stress_options.stress_repeat == 17 &&
+              stress_options.terms == 3,
+          "old-TACT-only CLI contract is incorrect");
+
+  bool clean_rejected = false;
+  try {
+    (void)parseOptions({
+        "tact_bench", "--engine", "baseline_fast", "--functions",
+        "sin,cos,tan", "--clean"});
+  } catch (const std::runtime_error&) {
+    clean_rejected = true;
+  }
+  require(clean_rejected, "removed clean mode was still accepted");
+
+  bool unsupported_sfu_rejected = false;
+  try {
+    (void)parseOptions({
+        "tact_bench", "--engine", "baseline_fast", "--functions",
+        "sin,cos,tan,sinh", "--stress-repeat", "2000"});
+  } catch (const UnsupportedError&) {
+    unsupported_sfu_rejected = true;
+  }
+  require(unsupported_sfu_rejected,
+          "unsupported SFU stress fusion was accepted");
 
   bool incompatible_rejected = false;
   try {

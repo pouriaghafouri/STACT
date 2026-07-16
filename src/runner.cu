@@ -10,7 +10,9 @@ static void dumpDebug(std::ostream& os,
                       const ProblemSpec& spec,
                       const std::vector<float>& in,
                       const std::vector<float>& out,
-                      const std::vector<float>& ref) {
+                      const std::vector<float>& ref,
+                      const std::vector<float>* sparse_intermediate,
+                      int sparse_ld) {
   const int rows = std::min(opt.debug_rows, (opt.n + spec.ipr - 1) / spec.ipr);
   const int values = std::min(opt.debug_values, opt.n);
   auto coefficients = buildCoefficientLayout(
@@ -102,8 +104,7 @@ static void dumpDebug(std::ostream& os,
       }
       max_permutation_difference = std::max(
           max_permutation_difference, std::abs(logical_dot - physical_dot));
-      float c = opt.tact_mode
-          ? 1.0f + opt.tact_steps * physical_dot : physical_dot;
+      const float c = 1.0f + opt.stress_repeat * physical_dot;
       os << ' ' << c;
     }
     os << '\n';
@@ -133,6 +134,29 @@ static void dumpDebug(std::ostream& os,
       os << ' ' << col_ind[i] << ':' << __half2float(vals[i]);
     }
     os << '\n';
+    if (sparse_intermediate && sparse_ld > 0) {
+      float max_intermediate_difference = 0.0f;
+      os << "cuSPARSE actual C^T / dense logical reference\n";
+      for (int row = 0; row < rows; ++row) {
+        os << "  row " << row << ':';
+        for (int col = 0; col < spec.num_funcs * spec.ipr; ++col) {
+          float expected = 0.0f;
+          for (int k = 0; k < WMMA_K; ++k) {
+            expected += __half2float(physical_a[row * WMMA_K + k]) *
+                        __half2float(
+                            coefficients.physical[k * WMMA_N + col]);
+          }
+          expected = 1.0f + opt.stress_repeat * expected;
+          float actual = (*sparse_intermediate)[col * sparse_ld + row];
+          max_intermediate_difference = std::max(
+              max_intermediate_difference, std::abs(actual - expected));
+          os << " c" << col << '=' << actual << "/" << expected;
+        }
+        os << '\n';
+      }
+      os << "cuSPARSE intermediate max difference: "
+         << max_intermediate_difference << '\n';
+    }
   }
   if (opt.layout == LAYOUT_SPARSE24) {
     os << "cuSPARSELt structured operand is physical B24 (Kx16 row-major); opA=T.\n";
@@ -166,56 +190,105 @@ static std::unique_ptr<Engine> makeSelectedEngine(const Options& opt, const Engi
   throw std::runtime_error("Unknown engine");
 }
 
+static std::vector<float> makeStressReference(
+    const Options& opt, const ProblemSpec& spec,
+    const std::vector<float>& input) {
+  std::vector<float> ref(size_t(spec.num_funcs) * opt.n, 0.0f);
+
+  if (opt.engine == ENGINE_SP || opt.engine == ENGINE_SFU) {
+    for (int i = 0; i < opt.n; ++i) {
+      float state = input[i];
+      float sine = 0.0f;
+      float tangent = 0.0f;
+      float hyperbolic_sine = 0.0f;
+      for (int j = 0; j < opt.stress_repeat; ++j) {
+        const float offset = float(j);
+        if (spec.num_funcs == 1) {
+          state = std::cos(state + offset);
+        } else {
+          sine = std::sin(state + offset);
+          state = std::cos(state + offset);
+          if (spec.num_funcs >= 3) tangent = std::tan(state + offset);
+          if (spec.num_funcs >= 4) {
+            hyperbolic_sine = std::sinh(state + offset);
+          }
+        }
+      }
+      if (spec.num_funcs == 1) {
+        ref[i] = state;
+      } else {
+        ref[i] = sine;
+        ref[size_t(opt.n) + i] = state;
+        if (spec.num_funcs >= 3) {
+          ref[size_t(2) * opt.n + i] = tangent;
+        }
+        if (spec.num_funcs >= 4) {
+          ref[size_t(3) * opt.n + i] = hyperbolic_sine;
+        }
+      }
+    }
+    return ref;
+  }
+
+  // Matrix reference: exactly the old Tensor Core algebra. A and B values are
+  // rounded to FP16 once, C starts at one, and only A*B is repeated.
+  for (int i = 0; i < opt.n; ++i) {
+    const float x = input[i];
+    for (int f = 0; f < spec.num_funcs; ++f) {
+      float dot = 0.0f;
+      for (int t = 0; t < opt.terms; ++t) {
+        const float power = __half2float(
+            __float2half(powerFor(x, t, spec.basis)));
+        const float coeff = __half2float(
+            __float2half(coeffFor(opt.funcs[f], t)));
+        dot += power * coeff;
+      }
+      const float residual = 1.0f + float(opt.stress_repeat) * dot;
+      ref[size_t(f) * opt.n + i] =
+          needsMultiplyByX(opt.funcs[f]) ? residual * x : residual;
+    }
+  }
+  return ref;
+}
+
 RunResult runBenchmark(const Options& opt) {
   ProblemSpec spec = makeProblemSpec(opt);
   if (opt.print_layout) printProblemSpec(spec, opt);
 
-  auto h_in = makeInputs(opt, spec.basis);
+  const auto h_in = makeInputs(opt, spec.basis);
   std::vector<int> h_funcs(spec.num_funcs);
   for (int i = 0; i < spec.num_funcs; ++i) h_funcs[i] = int(opt.funcs[i]);
 
   DeviceBuffer d_in(size_t(opt.n) * sizeof(float));
   DeviceBuffer d_out(size_t(spec.num_funcs) * opt.n * sizeof(float));
-  DeviceBuffer d_ref(size_t(spec.num_funcs) * opt.n * sizeof(float));
   DeviceBuffer d_funcs(size_t(spec.num_funcs) * sizeof(int));
   DeviceBuffer d_positions(size_t(spec.positions.size()) * sizeof(int));
   DeviceBuffer d_output_groups(size_t(spec.output_groups.size()) * sizeof(int));
 
-  TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(), size_t(opt.n) * sizeof(float), cudaMemcpyHostToDevice));
-  TACT_CUDA_CHECK(cudaMemcpy(d_funcs.as<int>(), h_funcs.data(), size_t(spec.num_funcs) * sizeof(int), cudaMemcpyHostToDevice));
-  TACT_CUDA_CHECK(cudaMemcpy(d_positions.as<int>(), spec.positions.data(), spec.positions.size() * sizeof(int), cudaMemcpyHostToDevice));
-  TACT_CUDA_CHECK(cudaMemcpy(d_output_groups.as<int>(), spec.output_groups.data(), spec.output_groups.size() * sizeof(int), cudaMemcpyHostToDevice));
-  TACT_CUDA_CHECK(cudaMemset(d_out.as<float>(), 0, size_t(spec.num_funcs) * opt.n * sizeof(float)));
-  TACT_CUDA_CHECK(cudaMemset(d_ref.as<float>(), 0, size_t(spec.num_funcs) * opt.n * sizeof(float)));
+  TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
+                             size_t(opt.n) * sizeof(float),
+                             cudaMemcpyHostToDevice));
+  TACT_CUDA_CHECK(cudaMemcpy(d_funcs.as<int>(), h_funcs.data(),
+                             size_t(spec.num_funcs) * sizeof(int),
+                             cudaMemcpyHostToDevice));
+  TACT_CUDA_CHECK(cudaMemcpy(d_positions.as<int>(), spec.positions.data(),
+                             spec.positions.size() * sizeof(int),
+                             cudaMemcpyHostToDevice));
+  TACT_CUDA_CHECK(cudaMemcpy(d_output_groups.as<int>(),
+                             spec.output_groups.data(),
+                             spec.output_groups.size() * sizeof(int),
+                             cudaMemcpyHostToDevice));
+  TACT_CUDA_CHECK(cudaMemset(d_out.as<float>(), 0,
+                             size_t(spec.num_funcs) * opt.n * sizeof(float)));
 
-  EngineContext ctx{&opt, spec, d_in.as<float>(), d_out.as<float>(), d_funcs.as<int>(),
-                    d_positions.as<int>(), d_output_groups.as<int>()};
-  EngineContext ref_ctx{&opt, spec, d_in.as<float>(), d_ref.as<float>(), d_funcs.as<int>(),
-                        d_positions.as<int>(), d_output_groups.as<int>()};
+  EngineContext ctx{&opt, spec, d_in.as<float>(), d_out.as<float>(),
+                    d_funcs.as<int>(), d_positions.as<int>(),
+                    d_output_groups.as<int>()};
 
-  if (opt.validate || opt.debug) {
-    auto ref_engine = allSfuSupported(opt.funcs)
-        ? makeSfuEngine(ref_ctx)
-        : makeSpEngine(ref_ctx);
-    ref_engine->run();
-    TACT_CUDA_CHECK(cudaDeviceSynchronize());
-    if (opt.tact_mode) {
-      int cos_output = opt.funcs.size() == 1 ? 0 : 1;
-      TACT_CUDA_CHECK(cudaMemcpy(d_ref.as<float>() + size_t(cos_output) * opt.n,
-                                 d_in.as<float>(), size_t(opt.n) * sizeof(float),
-                                 cudaMemcpyDeviceToDevice));
-    }
-    // TACT scalar kernels overwrite D. Restore the original input before
-    // warmup and measurement.
-    TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
-                               size_t(opt.n) * sizeof(float),
-                               cudaMemcpyHostToDevice));
-  }
-
-  auto init_start = std::chrono::high_resolution_clock::now();
+  const auto init_start = std::chrono::high_resolution_clock::now();
   auto engine = makeSelectedEngine(opt, ctx);
   TACT_CUDA_CHECK(cudaDeviceSynchronize());
-  auto init_stop = std::chrono::high_resolution_clock::now();
+  const auto init_stop = std::chrono::high_resolution_clock::now();
 
   std::vector<float> times;
   std::vector<float> h2d_times;
@@ -226,118 +299,128 @@ RunResult runBenchmark(const Options& opt) {
   kernel_times.reserve(opt.iterations);
   d2h_times.reserve(opt.iterations);
   std::vector<float> h_timed_out(size_t(spec.num_funcs) * opt.n);
-  SectionTimes section_sum;
 
+  // Scalar kernels overwrite d_in, so every warmup starts from the same host
+  // input. Matrix engines receive the same reset for a fair common path.
   for (int i = 0; i < opt.warmup; ++i) {
-    for (int r = 0; r < opt.inner_repeat; ++r) engine->run();
+    TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
+                               size_t(opt.n) * sizeof(float),
+                               cudaMemcpyHostToDevice));
+    engine->run();
     TACT_CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   for (int i = 0; i < opt.iterations; ++i) {
-    // Time input HtoD, complete GPU computation, and output DtoH separately
-    // on every measured iteration.
-    auto h2d_start = std::chrono::high_resolution_clock::now();
+    const auto h2d_start = std::chrono::high_resolution_clock::now();
     TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
                                size_t(opt.n) * sizeof(float),
                                cudaMemcpyHostToDevice));
-    auto h2d_stop = std::chrono::high_resolution_clock::now();
-    float h2d_ms = std::chrono::duration<float, std::milli>(h2d_stop - h2d_start).count();
+    const auto h2d_stop = std::chrono::high_resolution_clock::now();
+    const float h2d_ms =
+        std::chrono::duration<float, std::milli>(h2d_stop - h2d_start).count();
 
-    auto kernel_start = std::chrono::high_resolution_clock::now();
-    SectionTimes iter_sections;
-    for (int r = 0; r < opt.inner_repeat; ++r) {
-      if (opt.profile_sections) {
-        SectionTimes st = engine->runProfile();
-        iter_sections.scalar_ms += st.scalar_ms;
-        iter_sections.fused_kernel_ms += st.fused_kernel_ms;
-        iter_sections.build_power_ms += st.build_power_ms;
-        iter_sections.matmul_ms += st.matmul_ms;
-        iter_sections.postprocess_ms += st.postprocess_ms;
-      } else {
-        engine->run();
-      }
-    }
+    const auto kernel_start = std::chrono::high_resolution_clock::now();
+    // Main benchmark timing always uses the uninstrumented engine path.
+    // Section profiling is a separate diagnostic pass below so phase-event
+    // synchronizations cannot distort the latency comparison.
+    engine->run();
     TACT_CUDA_CHECK(cudaDeviceSynchronize());
-    auto kernel_stop = std::chrono::high_resolution_clock::now();
-    float kernel_ms = std::chrono::duration<float, std::milli>(kernel_stop - kernel_start).count();
+    const auto kernel_stop = std::chrono::high_resolution_clock::now();
+    const float kernel_ms =
+        std::chrono::duration<float, std::milli>(kernel_stop - kernel_start).count();
 
-    auto d2h_start = std::chrono::high_resolution_clock::now();
-    // TACT triple mode performs one DtoH copy per output array. Copy planes in
-    // physical function-group order: cosine, sine, then tangent.
-    for (int group = 0; group < spec.num_funcs; ++group) {
-      int output_index = 0;
-      while (spec.output_groups[output_index] != group) ++output_index;
-      const float* copy_source = d_out.as<float>() + size_t(output_index) * opt.n;
-      bool tact_scalar = opt.tact_mode &&
-          (opt.engine == ENGINE_SFU || opt.engine == ENGINE_SP);
-      if (tact_scalar && opt.funcs[output_index] == F_COS) {
-        copy_source = d_in.as<float>();
+    const auto d2h_start = std::chrono::high_resolution_clock::now();
+    for (int output_index = 0; output_index < spec.num_funcs; ++output_index) {
+      const float* source =
+          d_out.as<float>() + size_t(output_index) * opt.n;
+      if ((opt.engine == ENGINE_SFU || opt.engine == ENGINE_SP) &&
+          opt.funcs[output_index] == F_COS) {
+        source = d_in.as<float>();
       }
-      TACT_CUDA_CHECK(cudaMemcpy(h_timed_out.data() + size_t(output_index) * opt.n,
-                                 copy_source,
-                                 size_t(opt.n) * sizeof(float),
-                                 cudaMemcpyDeviceToHost));
+      TACT_CUDA_CHECK(cudaMemcpy(
+          h_timed_out.data() + size_t(output_index) * opt.n,
+          source, size_t(opt.n) * sizeof(float), cudaMemcpyDeviceToHost));
     }
-    auto d2h_stop = std::chrono::high_resolution_clock::now();
-    float d2h_ms = std::chrono::duration<float, std::milli>(d2h_stop - d2h_start).count();
+    const auto d2h_stop = std::chrono::high_resolution_clock::now();
+    const float d2h_ms =
+        std::chrono::duration<float, std::milli>(d2h_stop - d2h_start).count();
 
-    float total_ms = h2d_ms + kernel_ms + d2h_ms;
+    const float total_ms = h2d_ms + kernel_ms + d2h_ms;
     times.push_back(total_ms);
     h2d_times.push_back(h2d_ms);
     kernel_times.push_back(kernel_ms);
     d2h_times.push_back(d2h_ms);
-    section_sum.scalar_ms += iter_sections.scalar_ms;
-    section_sum.fused_kernel_ms += iter_sections.fused_kernel_ms;
-    section_sum.build_power_ms += iter_sections.build_power_ms;
-    section_sum.matmul_ms += iter_sections.matmul_ms;
-    section_sum.postprocess_ms += iter_sections.postprocess_ms;
   }
 
-  TACT_CUDA_CHECK(cudaDeviceSynchronize());
-
   RunResult result;
-  result.init_ms = std::chrono::duration<float, std::milli>(init_stop - init_start).count();
-  result.avg_h2d_ms = std::accumulate(h2d_times.begin(), h2d_times.end(), 0.0f) / float(h2d_times.size());
-  result.avg_kernel_ms = std::accumulate(kernel_times.begin(), kernel_times.end(), 0.0f) / float(kernel_times.size());
-  result.avg_d2h_ms = std::accumulate(d2h_times.begin(), d2h_times.end(), 0.0f) / float(d2h_times.size());
-  result.avg_ms = std::accumulate(times.begin(), times.end(), 0.0f) / float(times.size());
+  result.init_ms =
+      std::chrono::duration<float, std::milli>(init_stop - init_start).count();
+  result.avg_h2d_ms =
+      std::accumulate(h2d_times.begin(), h2d_times.end(), 0.0f) /
+      float(h2d_times.size());
+  result.avg_kernel_ms =
+      std::accumulate(kernel_times.begin(), kernel_times.end(), 0.0f) /
+      float(kernel_times.size());
+  result.avg_d2h_ms =
+      std::accumulate(d2h_times.begin(), d2h_times.end(), 0.0f) /
+      float(d2h_times.size());
+  result.avg_ms = std::accumulate(times.begin(), times.end(), 0.0f) /
+                  float(times.size());
   result.min_ms = *std::min_element(times.begin(), times.end());
   result.max_ms = *std::max_element(times.begin(), times.end());
   if (opt.profile_sections) {
-    float denom = float(opt.iterations);
-    result.avg_scalar_ms = section_sum.scalar_ms / denom;
-    result.avg_fused_kernel_ms = section_sum.fused_kernel_ms / denom;
-    result.avg_build_power_ms = section_sum.build_power_ms / denom;
-    result.avg_matmul_ms = section_sum.matmul_ms / denom;
-    result.avg_postprocess_ms = section_sum.postprocess_ms / denom;
+    // One separate diagnostic pass. It is intentionally excluded from avg_ms,
+    // min/max, and avg_kernel_ms.
+    TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
+                               size_t(opt.n) * sizeof(float),
+                               cudaMemcpyHostToDevice));
+    SectionTimes profile = engine->runProfile();
+    TACT_CUDA_CHECK(cudaDeviceSynchronize());
+    result.avg_scalar_ms = profile.scalar_ms;
+    result.avg_fused_kernel_ms = profile.fused_kernel_ms;
+    result.avg_build_power_ms = profile.build_power_ms;
+    result.avg_matmul_ms = profile.matmul_ms;
+    result.avg_postprocess_ms = profile.postprocess_ms;
+    result.avg_profiled_ms = profile.total_ms;
   }
-  result.timed_values = double(opt.n) * double(opt.inner_repeat);
-  result.timed_outputs = double(opt.n) * double(spec.num_funcs) * double(opt.inner_repeat);
-  result.throughput_mvals_s = result.timed_outputs / (double(result.avg_ms) * 1000.0);
+  result.timed_values = double(opt.n);
+  result.timed_outputs = double(opt.n) * double(spec.num_funcs);
+  result.throughput_mvals_s =
+      result.timed_outputs / (double(result.avg_ms) * 1000.0);
 
-  std::vector<float> h_out;
   std::vector<float> h_ref;
   if (opt.validate || opt.debug) {
-    h_out = h_timed_out;
-    h_ref.resize(size_t(spec.num_funcs) * opt.n);
-    TACT_CUDA_CHECK(cudaMemcpy(h_ref.data(), d_ref.as<float>(), h_ref.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    h_ref = makeStressReference(opt, spec, h_in);
   }
   if (opt.validate) {
-    RunResult v = computeValidation(h_out, h_ref, opt.n, spec.num_funcs, opt.threshold);
-    result.max_abs = v.max_abs;
-    result.max_rel = v.max_rel;
-    result.failures = v.failures;
-    result.func_max_abs = std::move(v.func_max_abs);
-    result.func_max_rel = std::move(v.func_max_rel);
-    result.func_failures = std::move(v.func_failures);
+    RunResult validation = computeValidation(
+        h_timed_out, h_ref, opt.n, spec.num_funcs, opt.threshold);
+    result.max_abs = validation.max_abs;
+    result.max_rel = validation.max_rel;
+    result.failures = validation.failures;
+    result.func_max_abs = std::move(validation.func_max_abs);
+    result.func_max_rel = std::move(validation.func_max_rel);
+    result.func_failures = std::move(validation.func_failures);
   }
+
   if (opt.debug) {
+    std::vector<float> sparse_intermediate;
+    int sparse_ld = 0;
+    const std::vector<float>* sparse_intermediate_ptr = nullptr;
+    if (engine->copyIntermediate(sparse_intermediate, sparse_ld)) {
+      sparse_intermediate_ptr = &sparse_intermediate;
+    }
     if (opt.debug_file.empty()) {
-      dumpDebug(std::cerr, opt, spec, h_in, h_out, h_ref);
+      dumpDebug(std::cerr, opt, spec, h_in, h_timed_out, h_ref,
+                sparse_intermediate_ptr, sparse_ld);
     } else {
       std::ofstream debug_out(opt.debug_file);
-      if (!debug_out) throw std::runtime_error("Could not open debug file: " + opt.debug_file);
-      dumpDebug(debug_out, opt, spec, h_in, h_out, h_ref);
+      if (!debug_out) {
+        throw std::runtime_error(
+            "Could not open debug file: " + opt.debug_file);
+      }
+      dumpDebug(debug_out, opt, spec, h_in, h_timed_out, h_ref,
+                sparse_intermediate_ptr, sparse_ld);
     }
   }
 

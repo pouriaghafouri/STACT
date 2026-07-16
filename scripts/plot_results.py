@@ -40,15 +40,15 @@ def grouped_plot(plt, rows, cases, key, ylabel, output):
     plt.close()
 
 
-def speedup_plot(plt, rows, cases, reference_method, output):
+def speedup_plot(plt, rows, cases, reference_method, key, output):
     references = {
-        row["case_label"]: number(row, "avg_ms")
+        row["case_label"]: number(row, key)
         for row in rows if row["method"] == reference_method
     }
     speedup_rows = []
     for row in rows:
         reference = references.get(row["case_label"], math.nan)
-        latency = number(row, "avg_ms")
+        latency = number(row, key)
         copied = dict(row)
         copied["speedup"] = (
             reference / latency
@@ -58,7 +58,7 @@ def speedup_plot(plt, rows, cases, reference_method, output):
         speedup_rows.append(copied)
     grouped_plot(
         plt, speedup_rows, cases, "speedup",
-        f"Speedup relative to {reference_method}", output,
+        f"Kernel speedup relative to {reference_method}", output,
     )
 
 
@@ -90,7 +90,7 @@ def section_plot(plt, rows, cases, output):
         plt.bar(x, values, bottom=bottom, label=label)
         bottom = [old + value for old, value in zip(bottom, values)]
     plt.xticks(x, labels, rotation=35, ha="right")
-    plt.ylabel("Average section time (ms)")
+    plt.ylabel("Separate profile-pass time (ms)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(output, dpi=160)
@@ -139,10 +139,14 @@ def main():
 
     grouped_plot(plt, valid_rows, cases, "avg_ms", "Average total latency (ms)",
                  outdir / "avg_ms.png")
+    grouped_plot(plt, valid_rows, cases, "kernel_ms", "Average kernel latency (ms)",
+                 outdir / "kernel_ms.png")
     grouped_plot(plt, valid_rows, cases, "throughput_mvalues_s", "Throughput (Mvalues/s)",
                  outdir / "throughput.png")
-    speedup_plot(plt, valid_rows, cases, "SFU", outdir / "speedup_vs_sfu.png")
-    speedup_plot(plt, valid_rows, cases, "SP", outdir / "speedup_vs_sp.png")
+    speedup_plot(plt, valid_rows, cases, "SFU", "kernel_ms",
+                 outdir / "speedup_vs_sfu.png")
+    speedup_plot(plt, valid_rows, cases, "SP", "kernel_ms",
+                 outdir / "speedup_vs_sp.png")
     section_plot(plt, valid_rows, cases, outdir / "section_times.png")
 
     print(f"Wrote plots to {outdir}; skipped {len(skipped)} non-success rows")

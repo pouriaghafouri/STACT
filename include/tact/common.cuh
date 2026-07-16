@@ -51,7 +51,11 @@
     _oss << "cuSPARSELt error " << cusparseGetErrorName(_s)            \
          << " (" << cusparseGetErrorString(_s) << ", code "           \
          << int(_s) << ") at " << __FILE__ << ":" << __LINE__;        \
-    throw std::runtime_error(_oss.str());                               \
+    if (_s == CUSPARSE_STATUS_NOT_SUPPORTED ||                           \
+        _s == CUSPARSE_STATUS_ARCH_MISMATCH) {                           \
+      throw UnsupportedError(_oss.str());                               \
+    }                                                                    \
+    throw std::runtime_error(_oss.str());                                \
   }                                                                     \
 } while(0)
 #else
@@ -59,6 +63,11 @@
 #endif
 
 namespace tact {
+
+class UnsupportedError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
@@ -104,11 +113,12 @@ struct Options {
   EngineKind engine = ENGINE_WMMA;
   LayoutKind layout = LAYOUT_DENSE;
   std::vector<FunctionId> funcs{F_SIN, F_COS, F_TAN};
-  int terms = 5;
+  // Three terms reproduces cosine_tensor_core/TripleTranscendCore exactly.
+  // Higher term counts remain explicit generalized accuracy experiments.
+  int terms = 3;
   int n = 1 << 20;
-  int warmup = 5;
+  int warmup = 0;
   int iterations = 20;
-  int inner_repeat = 1;
   float threshold = 1e-5f;
   uint64_t seed = 1234;
   bool min_set = false;
@@ -116,11 +126,13 @@ struct Options {
   float xmin = 0.0f;
   float xmax = 0.0f;
   std::string csv_path;
-  bool validate = true;
+  bool validate = false;
   bool print_layout = false;
-  bool profile_sections = true;
-  bool tact_mode = false;
-  int tact_steps = 2000;
+  bool profile_sections = false;
+  // The project intentionally implements only the original TACT stress
+  // workload: the core operation is repeated in-place, with 2000 repeats by
+  // default. There is no alternate "clean" execution mode.
+  int stress_repeat = 2000;
   bool debug = false;
   int debug_values = 8;
   int debug_rows = 2;
@@ -160,6 +172,7 @@ struct RunResult {
   float avg_build_power_ms = 0.0f;
   float avg_matmul_ms = 0.0f;
   float avg_postprocess_ms = 0.0f;
+  float avg_profiled_ms = 0.0f;
   double throughput_mvals_s = 0.0;
   double timed_values = 0.0;
   double timed_outputs = 0.0;
@@ -233,7 +246,14 @@ Options parseArgs(int argc, char** argv);
 bool isEvenGroup(FunctionId f);
 bool isMixedGroup(FunctionId f);
 bool isSfuSupported(FunctionId f);
-bool allSfuSupported(const std::vector<FunctionId>& funcs);
+
+// Factored odd transcendental series produce a residual polynomial in x^2.
+// Match the original TACT post-processing by multiplying that residual by the
+// original input x only for odd functions. This helper is used from both host
+// validation code and CUDA device kernels, so it must remain header-defined.
+__host__ __device__ inline bool needsMultiplyByX(FunctionId f) {
+  return f == F_SIN || f == F_TAN || f == F_SINH || f == F_TANH;
+}
 BasisKind determineBasis(const std::vector<FunctionId>& funcs);
 int inputsPerRow(int terms, int num_funcs);
 int roundUp(int x, int a);
@@ -307,22 +327,6 @@ __host__ __device__ inline float coeffFor(FunctionId f, int t) {
     }
   }
   return 0.0f;
-}
-
-__host__ __device__ inline bool hasLeadingOne(FunctionId f) {
-  return f == F_EXP || f == F_SIN || f == F_COS || f == F_TAN ||
-         f == F_SINH || f == F_COSH || f == F_TANH;
-}
-
-__host__ __device__ inline bool needsMultiplyByX(FunctionId f) {
-  return f == F_SIN || f == F_TAN || f == F_SINH || f == F_TANH;
-}
-
-__host__ __device__ inline float postprocess(FunctionId f, float residual, float x) {
-  float y = residual;
-  if (hasLeadingOne(f)) y += 1.0f;
-  if (needsMultiplyByX(f)) y *= x;
-  return y;
 }
 
 __host__ __device__ inline float powerFor(float x, int t, BasisKind basis) {

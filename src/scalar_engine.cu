@@ -11,11 +11,11 @@ class ScalarEngine final : public Engine {
 
   void run(cudaStream_t stream = nullptr) override {
     if (use_sfu_) {
-      launchSfu(ctx_.d_in, ctx_.d_out, ctx_.d_funcs, ctx_.spec.num_funcs,
-                ctx_.opt->n, ctx_.opt->tact_mode, ctx_.opt->tact_steps, stream);
+      launchSfu(ctx_.d_in, ctx_.d_out, ctx_.spec.num_funcs,
+                ctx_.opt->n, ctx_.opt->stress_repeat, stream);
     } else {
-      launchSp(ctx_.d_in, ctx_.d_out, ctx_.d_funcs, ctx_.spec.num_funcs,
-               ctx_.opt->n, ctx_.opt->tact_mode, ctx_.opt->tact_steps, stream);
+      launchSp(ctx_.d_in, ctx_.d_out, ctx_.spec.num_funcs,
+               ctx_.opt->n, ctx_.opt->stress_repeat, stream);
     }
   }
 
@@ -39,7 +39,7 @@ class ScalarEngine final : public Engine {
 std::unique_ptr<Engine> makeSfuEngine(const EngineContext& ctx) {
   for (FunctionId function : ctx.opt->funcs) {
     if (!isSfuSupported(function)) {
-      throw std::runtime_error(
+      throw UnsupportedError(
           std::string("SFU engine does not support function ") +
           functionName(function));
     }

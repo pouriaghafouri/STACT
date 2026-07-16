@@ -1,420 +1,482 @@
-# TACT benchmark project
+# STACT — Sparse Tensor Accelerated Computation of Transcendentals
 
-TACT expresses truncated transcendental-function series as a shared input-power
-matrix multiplied by a coefficient matrix. The project compares five CUDA
-engines:
+STACT is a CUDA research project for comparing several GPU implementations of transcendental functions:
 
-1. `sfu`: CUDA fast intrinsics.
-2. `sp`: standard single-precision CUDA math.
-3. `wmma`: dense Tensor Core WMMA.
-4. `cusparse`: the same matrix product with CSR coefficients.
-5. `cusparselt`: the same matrix product with 2:4 structured coefficients.
+* **SP**: standard single-precision CUDA math functions
+* **SFU**: fast intrinsic/SFU-style CUDA functions
+* **Tensor Core**: TACT implementation based on WMMA
+* **cuSPARSE**: sparse matrix implementation of the same TACT polynomial formulation
+* **cuSPARSELt**: 2:4 structured-sparse Tensor Core implementation
 
-Supported functions are `exp`, `ln1p`, `sin`, `cos`, `tan`, `sinh`, `cosh`,
-and `tanh`. One fused call may contain up to four functions from either the
-even-power group `{sin,cos,tan,sinh,cosh,tanh}` or the mixed-power group
-`{exp,ln1p}`.
+The Tensor Core implementation follows the kernel and stress-test style of the reference programs in the `tact/` directory.
 
-### SFU support is intentionally narrower
+---
 
-The SFU engine accepts only functions with an explicit fast intrinsic in this
-project:
+## Supported benchmark cases
 
-| Function | SFU implementation |
-|---|---|
-| `exp` | `__expf` |
-| `ln1p` | `__logf(1+x)` |
-| `sin` | `__sinf` |
-| `cos` | `__cosf` |
-| `tan` | `__tanf` |
+The main benchmark cases are:
 
-`sinh`, `cosh`, and `tanh` are not SFU-supported. A fused SFU request is
-accepted only when every requested function appears in the table. The engine
-returns a clear error otherwise; it never substitutes an SP function. SP and
-the three matrix engines support all eight implemented functions.
+| Case   | Functions          |
+| ------ | ------------------ |
+| Single | `cos`              |
+| Dual   | `sin,cos`          |
+| Triple | `sin,cos,tan`      |
+| Quad   | `sin,cos,tan,sinh` |
 
-## Shared matrix design
+The old TACT-compatible default polynomial configuration is:
 
-Every matrix engine uses one canonical logical coefficient matrix `B` with
-shape `16 x 16`:
-
-- Tile/power matrix `A` packs several input values per row.
-- Each input slot owns `terms` K positions.
-- Function columns use a stable physical order; triple fusion uses
-  `cos`, `sin`, then `tan`, matching TACT.
-- WMMA consumes row-major physical `B` (`B` itself in dense mode, or the
-  paired K permutation in `sparse24` mode).
-- cuSPARSE consumes `CSR(B^T)` and computes `B^T * A^T`.
-- cuSPARSELt stores `B` as its structured operand and uses transposed
-  row-major descriptors.
-
-For `sparse24`, the K positions are permuted so every coefficient column has at
-most two nonzeros in each group of four. The identical permutation is applied
-to `A`, so the mathematical product is unchanged. The implementation retains
-both canonical logical `B` and physical `B24`, plus a full logical-K to
-physical-K permutation. Debug mode verifies that their dot products agree.
-
-## Build
-
-WMMA and cuSPARSE:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+```text
+terms = 3
 ```
 
-CUDA `-O0` is enabled by default for stable TACT stress measurements. Use
-`-DTACT_CUDA_O0=OFF` for optimized clean-mode experiments. Fast math is applied
-only to `src/sfu_kernels.cu`; it never affects SP or the matrix engines.
+---
 
-cuSPARSELt:
+## Stress-test semantics
 
-```bash
-export CUSPARSELT_ROOT=/path/to/cusparselt
-cmake -S . -B build-slt -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=86 -DTACT_ENABLE_CUSPARSELT=ON
-cmake --build build-slt -j
-```
+This project intentionally follows the stress-test style of the reference TACT kernels.
 
-cuSPARSELt requires Ampere or newer sparse Tensor Cores.
+The stress loop is applied only to the core computation.
 
-### Reference source builds
+### SP and SFU
 
-The sources under `tact/` remain the behavioral reference. Compile all six
-reference programs with:
+Only the transcendental function evaluations are repeated.
 
-```bash
-bash scripts/compile_reference_tact.sh
-```
+### Tensor Core
 
-The equivalent commands use `-O0 -arch=sm_86`; only SFU receives
-`--use_fast_math`:
+Tile construction and fragment loading are performed once. Only the following operation is repeated:
 
-```bash
-cd tact
-nvcc -O0 -arch=sm_86 cosine_tensor_core.cu -o cosine_tensor_core
-nvcc -O0 -arch=sm_86 TripleTranscendCore.cu -o TripleTranscendCore
-nvcc -O0 -arch=sm_86 --use_fast_math cosine_SFU.cu -o cosine_SFU
-nvcc -O0 -arch=sm_86 --use_fast_math TripleTranscendSFU.cu -o TripleTranscendSFU
-nvcc -O0 -arch=sm_86 cosine_SP.cu -o cosine_SP
-nvcc -O0 -arch=sm_86 TripleTranscendSP.cu -o TripleTranscendSP
-```
-
-## TACT and clean modes
-
-`cos` and `sin,cos,tan` automatically select the canonical three-term,
-2,000-step TACT workload unless a different term count or `--clean` is given.
-The explicit form is:
-
-```bash
-./build/tact_bench --engine wmma --layout dense \
-  --functions sin,cos,tan --terms 3 --tact --steps 2000 \
-  --n 10000000 --iterations 50 --no-validate
-```
-
-The scalar TACT kernels retain the original chained behavior and global writes:
-
-- SFU: `sin`, `D=cos`, then `tan` from the updated D.
-- SP: `sin`, `tan`, then `D=cos`.
-- Both use 64-thread blocks and write during every stress step.
-
-WMMA initializes its accumulator to one and repeats MMA `steps` times. Sparse
-engines compute the equivalent aggregate `1 + steps*(A*B)` by passing
-`alpha=steps` to their sparse matmul and applying the same post-processing.
-This preserves the logical TACT result without issuing thousands of library
-kernel launches.
-
-Use clean mode for a normal one-pass approximation and validation:
-
-```bash
-./build/tact_bench --engine wmma --clean --terms 5 \
-  --functions sin,cos,tan --n 1000000 --iterations 20 --threshold 1e-3
-./build/tact_bench --engine cusparse --layout sparse24 --clean --terms 5 \
-  --functions sin,cos,tan --n 1000000 --iterations 20 --threshold 1e-3
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean --terms 5 \
-  --functions sin,cos,tan --n 1000000 --iterations 20 --threshold 5e-3
-```
-
-Single, dual, triple, and quad clean fusion are supported:
-
-```bash
-./build/tact_bench --engine wmma --clean --terms 5 --functions cos --threshold 1e-3
-./build/tact_bench --engine wmma --clean --terms 5 --functions sin,cos --threshold 1e-3
-./build/tact_bench --engine wmma --clean --terms 5 --functions sin,cos,tan --threshold 1e-3
-./build/tact_bench --engine wmma --clean --terms 3 --functions sin,cos,tan,sinh --threshold 1e-3
-```
-
-The same four shapes are supported by SP, WMMA, cuSPARSE, and cuSPARSELt.
-SFU supports the first three; the example quad is rejected because `sinh` has
-no supported fast intrinsic. Requests mixing the even and mixed power groups,
-such as `sin,exp`, are rejected rather than computed with an invalid shared A.
-
-`N` is the number of input values per engine run. A run requesting `F`
-functions produces exactly `N * F` values in function-major output layout.
-
-## Examples by engine
-
-All commands below can be copied from the repository root. Use `--clean`
-when comparing mathematical outputs and `--tact` when reproducing the old
-TACT stress workload. The `--terms` option controls the matrix approximation;
-SP and SFU evaluate the requested CUDA functions directly but accept the same
-option so one command configuration can be shared by all engines.
-
-### SP
-
-SP uses standard CUDA single-precision functions such as `sinf`, `cosf`,
-`tanf`, and `sinhf`. It supports every implemented function and every clean
-fusion size.
-
-```bash
-# Single cosine
-./build/tact_bench --engine sp --clean --functions cos --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Dual sine and cosine
-./build/tact_bench --engine sp --clean --functions sin,cos --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Triple sine, cosine, and tangent
-./build/tact_bench --engine sp --clean --functions sin,cos,tan --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Quad including standard sinhf
-./build/tact_bench --engine sp --clean --functions sin,cos,tan,sinh --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Old TripleTranscendSP-style stress kernel
-./build/tact_bench --engine sp --tact --functions sin,cos,tan --terms 3 \
-  --steps 2000 --n 10000000 --warmup 1 --iterations 50 --no-validate
-```
-
-### SFU
-
-SFU uses only the explicitly supported fast intrinsics: `__expf`,
-`__logf(1+x)`, `__sinf`, `__cosf`, and `__tanf`. There is no standard-math
-fallback inside this engine.
-
-```bash
-# Single fast cosine
-./build/tact_bench --engine sfu --clean --functions cos --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Supported mixed-basis pair
-./build/tact_bench --engine sfu --clean --functions exp,ln1p --terms 5 \
-  --min -0.1 --max 0.1 --n 1000000 --iterations 20 --validate
-
-# Supported triple fast-intrinsic case
-./build/tact_bench --engine sfu --clean --functions sin,cos,tan --terms 5 \
-  --n 1000000 --warmup 5 --iterations 20 --validate
-
-# Old TripleTranscendSFU-style stress kernel
-./build/tact_bench --engine sfu --tact --functions sin,cos,tan --terms 3 \
-  --steps 2000 --n 10000000 --warmup 1 --iterations 50 --no-validate
-```
-
-For example, this request is intentionally rejected because `sinh` has no
-supported SFU intrinsic in TACT:
-
-```bash
-./build/tact_bench --engine sfu --clean --functions sin,cos,tan,sinh
-# Error: SFU engine does not support function sinh
-```
-
-### Tensor Core / WMMA
-
-The `wmma` engine builds the powers and coefficient tile inside one fused CUDA
-kernel and executes the series through `wmma::mma_sync`. Dense layout is the
-canonical old-TACT arrangement.
-
-```bash
-# Single Tensor Core cosine
-./build/tact_bench --engine wmma --layout dense --clean \
-  --functions cos --terms 5 --n 1000000 --iterations 20 \
-  --threshold 1e-3 --validate
-
-# Dual Tensor Core fusion
-./build/tact_bench --engine wmma --layout dense --clean \
-  --functions sin,cos --terms 5 --n 1000000 --iterations 20 \
-  --threshold 1e-3 --validate
-
-# Triple Tensor Core fusion
-./build/tact_bench --engine wmma --layout dense --clean \
-  --functions sin,cos,tan --terms 5 --n 1000000 --iterations 20 \
-  --threshold 1e-3 --validate
-
-# Quad Tensor Core fusion
-./build/tact_bench --engine wmma --layout dense --clean \
-  --functions sin,cos,tan,sinh --terms 5 --n 1000000 \
-  --iterations 20 --threshold 1e-3 --validate
-
-# Old TripleTranscendCore-style stress kernel: 1 + 2000 * (A x B)
-./build/tact_bench --engine wmma --layout dense --tact \
-  --functions sin,cos,tan --terms 3 --steps 2000 \
-  --n 10000000 --warmup 1 --iterations 50 --no-validate
-```
-
-WMMA can also consume the paired physical K permutation for layout debugging:
-
-```bash
-./build/tact_bench --engine wmma --layout sparse24 --clean \
-  --functions sin,cos,tan --terms 5 --n 64 --warmup 0 --iterations 1 \
-  --threshold 1e-3 --debug --validate
+```cpp
+wmma::mma_sync(...)
 ```
 
 ### cuSPARSE
 
-The `cusparse` engine builds the same physical power matrix as WMMA, converts
-the coefficient operand to `CSR(B^T)`, and computes `B^T * A^T`. It is included
-in the regular `build/tact_bench` binary. Both K orderings are supported: use
-`dense` for sequential K rows or `sparse24` for the same permutation used by
-cuSPARSELt.
+The power matrix is constructed once and postprocessing is performed once. Only the sparse matrix multiplication is repeated:
 
-```bash
-# Dense logical K ordering
-./build/tact_bench --engine cusparse --layout dense --clean \
-  --functions sin,cos,tan --terms 5 --n 1000000 \
-  --iterations 20 --threshold 1e-3 --validate
-
-# 2:4-compatible physical K ordering, still stored as ordinary CSR
-./build/tact_bench --engine cusparse --layout sparse24 --clean \
-  --functions sin,cos,tan,sinh --terms 5 --n 1000000 \
-  --iterations 20 --threshold 1e-3 --validate
-
-# Sparse-library version of the canonical triple stress workload
-./build/tact_bench --engine cusparse --layout sparse24 --tact \
-  --functions sin,cos,tan --terms 3 --steps 2000 \
-  --n 10000000 --warmup 1 --iterations 50 --no-validate
+```cpp
+cusparseSpMM(...)
 ```
 
 ### cuSPARSELt
 
-cuSPARSELt must be enabled at build time and requires `--layout sparse24`.
-TACT verifies the generated 2:4 matrix, compresses it during engine setup, and
-uses sparse Tensor Cores for the structured matrix multiplication.
+Matrix descriptors, compression, workspace allocation, power-matrix construction, and postprocessing are outside the stress loop. Only the structured sparse multiplication is repeated:
 
-```bash
-# Single structured-sparse cosine
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean \
-  --functions cos --terms 5 --n 1000000 \
-  --iterations 20 --threshold 5e-3 --validate
-
-# Dual structured-sparse fusion
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean \
-  --functions sin,cos --terms 5 --n 1000000 \
-  --iterations 20 --threshold 5e-3 --validate
-
-# Triple structured-sparse fusion
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean \
-  --functions sin,cos,tan --terms 5 --n 1000000 \
-  --iterations 20 --threshold 5e-3 --validate
-
-# Quad structured-sparse fusion
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean \
-  --functions sin,cos,tan,sinh --terms 5 --n 1000000 \
-  --iterations 20 --threshold 5e-3 --validate
-
-# Structured-sparse version of the triple stress workload
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --tact \
-  --functions sin,cos,tan --terms 3 --steps 2000 \
-  --n 10000000 --warmup 1 --iterations 50 --no-validate
+```cpp
+cusparseLtMatmul(...)
 ```
 
-### Direct five-engine triple comparison
+The default TACT-style stress count is:
 
-These commands use identical clean-mode inputs and iteration counts. The
-regular engines come from `build/tact_bench`; only cuSPARSELt uses the
-separately configured binary.
-
-```bash
-./build/tact_bench --engine sp --layout dense --clean \
-  --functions sin,cos,tan --terms 5 --n 10000000 --iterations 50 --validate
-
-./build/tact_bench --engine sfu --layout dense --clean \
-  --functions sin,cos,tan --terms 5 --n 10000000 --iterations 50 --validate
-
-./build/tact_bench --engine wmma --layout dense --clean \
-  --functions sin,cos,tan --terms 5 --n 10000000 --iterations 50 \
-  --threshold 1e-3 --validate
-
-./build/tact_bench --engine cusparse --layout sparse24 --clean \
-  --functions sin,cos,tan --terms 5 --n 10000000 --iterations 50 \
-  --threshold 1e-3 --validate
-
-./build-slt/tact_bench --engine cusparselt --layout sparse24 --clean \
-  --functions sin,cos,tan --terms 5 --n 10000000 --iterations 50 \
-  --threshold 5e-3 --validate
+```text
+stress-repeat = 2000
 ```
 
-For the historical performance ordering, replace the clean options
-(`--clean --terms 5 --validate`) with
-`--tact --terms 3 --steps 2000 --no-validate` in the five commands. Keep WMMA
-on `dense`; the sparse engines may use `sparse24`.
+There is no separate clean benchmark mode in the intended TACT-compatible experiment.
 
-## Timing
+---
 
-Every measured iteration reports:
+## Requirements
 
-- `HtoD avg ms`: input transfer.
-- `kernel avg ms`: all engine work required to produce outputs.
-- `DtoH avg ms`: one synchronous copy per physical output group.
-- `total avg ms`: HtoD + kernel + DtoH.
-- `init ms`: reusable coefficients, descriptors, compression, and workspace.
+* Linux
+* CMake 3.18 or newer
+* CUDA Toolkit
+* GPU supporting the requested CUDA architecture
+* cuSPARSE
+* cuSPARSELt for the cuSPARSELt engine
 
-Matrix-engine kernel timing includes power construction, matmul, post-processing,
-and writes. Section profiling reports those phases separately and can be disabled
-with `--no-profile-sections`.
+The example build commands target:
 
-## Validation and debugging
-
-Clean mode validates every output and reports global and per-function
-absolute/relative errors and failure counts. SFU is the reference only when it
-supports the complete function set; otherwise validation automatically uses
-SP. TACT mode disables validation by default because its scalar chain and
-matrix accumulation are intentionally different workloads.
-
-For layout inspection:
-
-```bash
-./build/tact_bench --engine wmma --clean --functions sin,cos,tan \
-  --terms 3 --n 64 --iterations 1 --warmup 0 --debug \
-  --debug-values 8 --debug-rows 2 --threshold 1e-3
+```text
+sm_86
 ```
 
-Debug output includes inputs, function order, logical and physical slot-to-K
-mapping, logical A/B/C, physical A24/B24, the maximum logical/physical dot
-difference, outputs, references, errors, CSR entries, and 2:4 validity.
+---
 
-## Sweeps and plots
+## Build the regular project
+
+The regular build contains:
+
+* SP
+* SFU
+* Tensor Core / WMMA
+* cuSPARSE
+
+Run:
 
 ```bash
-bash scripts/run_benchmarks.sh
-python3 scripts/plot_results.py results/benchmark_results.csv --outdir results/plots
+rm -rf build
+
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+
+cmake --build build -j
+
+ctest --test-dir build --output-on-failure
 ```
 
-Plot generation requires Python 3 and `matplotlib`; the benchmark sweep itself
-has no Python dependency.
+The main executable is:
 
-The sweep covers single, dual, triple, and quad fusion across SP, SFU, WMMA,
-cuSPARSE, and cuSPARSELt. Its CSV records `ok`, `validation_failed`, `failed`,
-`unsupported`, and `unavailable` rows and links each row to a log. Unsupported
-SFU entries are never plotted as timings.
+```text
+build/tact_bench
+```
 
-Configuration is controlled by `BIN`, `BIN_SLT`, `OUTDIR`, `CSV`, `N`,
-`ITERATIONS`, `WARMUP`, `INNER_REPEAT`, `TERMS`, `THRESHOLD`,
-`CUSPARSELT_THRESHOLD`, `INPUT_MIN`, `INPUT_MAX`, `VALIDATE`, `MODE`,
-`TACT_STEPS`, and `STRICT`. Defaults use clean mode and the conservative range
-`[-pi/4, pi/4]`. The plotting script produces latency, throughput, SFU/SP
-speedup, section-time plots, and a status summary.
+---
 
-## Limitations
+## Build with cuSPARSELt
 
-- Taylor accuracy depends on the input interval and number of terms.
-- FP16 powers and coefficients add rounding error.
-- Tangent error grows rapidly near its poles.
-- cuSPARSELt may be slower than cuSPARSE for a tiny coefficient matrix.
-- cuSPARSELt output is FP16 in the supported descriptor configuration, whereas
-  WMMA and cuSPARSE accumulate into FP32 outputs.
-- SFU results exist only for the five explicitly supported fast intrinsics.
-- Incompatible even/mixed power groups cannot share one fused Tile A.
-- cuSPARSELt requires a supported GPU and an installed cuSPARSELt library.
+The project expects a cuSPARSELt installation containing:
+
+```text
+include/cusparseLt.h
+lib/libcusparseLt.so
+```
+
+When using the cuSPARSELt copy included in this project:
+
+```bash
+rm -rf build-slt
+
+cmake -S . -B build-slt \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DTACT_ENABLE_CUSPARSELT=ON \
+  -DCUSPARSELT_ROOT="$PWD/.deps/cusparselt-0.4"
+
+cmake --build build-slt -j
+
+ctest --test-dir build-slt --output-on-failure
+```
+
+The cuSPARSELt-enabled executable is:
+
+```text
+build-slt/tact_bench
+```
+
+If the runtime cannot find `libcusparseLt.so`, run:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/.deps/cusparselt-0.4/lib:${LD_LIBRARY_PATH:-}"
+```
+
+---
+
+## Reference TACT compilation
+
+The standalone reference programs in `tact/` should be compiled using the following styles.
+
+### Tensor Core reference programs
+
+```bash
+nvcc -O0 -arch=sm_86 tensor_core.cu -o tensor_core
+```
+
+### SFU reference programs
+
+```bash
+nvcc -O0 -arch=sm_86 --use_fast_math SFU.cu -o SFU
+```
+
+### SP reference programs
+
+```bash
+nvcc -O0 -arch=sm_86 SP.cu -o SP
+```
+
+Use the actual source filenames in the `tact/` directory.
+
+---
+
+# Triple-function benchmark
+
+The triple-function workload computes:
+
+```text
+sin(x), cos(x), tan(x)
+```
+
+The following commands use:
+
+```text
+N              = 100000000
+terms          = 3
+stress-repeat  = 2000
+iterations     = 1
+input range    = [-π/4, π/4]
+threshold      = 5e-3
+```
+
+Because `N=100000000` and `stress-repeat=2000` create a very large workload, start with one benchmark iteration.
+
+---
+
+## SP
+
+```bash
+./build/tact_bench \
+  --engine baseline_sp \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+## SFU
+
+```bash
+./build/tact_bench \
+  --engine baseline_fast \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+## Tensor Core / WMMA
+
+```bash
+./build/tact_bench \
+  --engine wmma \
+  --layout dense \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+## cuSPARSE
+
+```bash
+./build/tact_bench \
+  --engine cusparse \
+  --layout sparse24 \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+## cuSPARSELt
+
+```bash
+./build-slt/tact_bench \
+  --engine cusparselt \
+  --layout sparse24 \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+# Copy-paste all triple-function benchmarks
+
+```bash
+echo "================ SP ================"
+
+./build/tact_bench \
+  --engine baseline_sp \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+
+echo "================ SFU ================"
+
+./build/tact_bench \
+  --engine baseline_fast \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+
+echo "============ Tensor Core ==========="
+
+./build/tact_bench \
+  --engine wmma \
+  --layout dense \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+
+echo "============= cuSPARSE ============="
+
+./build/tact_bench \
+  --engine cusparse \
+  --layout sparse24 \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+
+echo "============ cuSPARSELt ============"
+
+./build-slt/tact_bench \
+  --engine cusparselt \
+  --layout sparse24 \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 100000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339
+```
+
+---
+
+## Increase the number of measured iterations
+
+After confirming that all five implementations run successfully, increase:
+
+```bash
+--iterations 1
+```
+
+to:
+
+```bash
+--iterations 3
+```
+
+or:
+
+```bash
+--iterations 5
+```
+
+Using multiple iterations provides a more stable average but increases the total execution time significantly.
+
+---
+
+## Validation
+
+Validation reports:
+
+* maximum absolute error
+* maximum relative error
+* total number of failures
+* per-function errors where available
+
+The Tensor Core and sparse methods use FP16 operands and may require a looser threshold than SP or SFU.
+
+For the triple-function experiment, the recommended initial threshold is:
+
+```text
+5e-3
+```
+
+The input interval is restricted to:
+
+```text
+[-π/4, π/4]
+```
+
+because low-order Taylor approximations, especially for tangent, become less accurate over wider intervals.
+
+---
+
+## Meaning of `N`
+
+`N` is the number of input values processed in one benchmark iteration.
+
+For the triple-function workload:
+
+```text
+functions = 3
+N         = 100000000
+```
+
+the benchmark produces:
+
+```text
+3 × 100000000 = 300000000
+```
+
+function output values per iteration.
+
+---
+
+## Memory warning for `N=100000000`
+
+A triple-function output array alone requires approximately:
+
+```text
+3 × 100000000 × 4 bytes ≈ 1.2 GB
+```
+
+The input array requires approximately:
+
+```text
+100000000 × 4 bytes ≈ 400 MB
+```
+
+Tensor Core and sparse engines also allocate intermediate power and result matrices. Therefore, `N=100000000` may exceed the available VRAM on GPUs with 4 GB or 6 GB of memory, especially for cuSPARSE.
+
+If an execution reports an out-of-memory error, first test with:
+
+```bash
+--n 10000000
+```
+
+and then increase `N` gradually.
+
+---
+
+## Important notes
+
+* Use `terms=3` for the old TACT-compatible experiment.
+* The stress loop repeats only the core operation.
+* Do not use a separate `--clean` mode for this experiment.
+* SFU should only be used for functions explicitly supported by the SFU engine.
+* cuSPARSE and cuSPARSELt must compute the same logical polynomial as the Tensor Core implementation.
+* cuSPARSELt requires a valid 2:4 structured sparse coefficient layout.
+* cuSPARSE or cuSPARSELt may be slower than WMMA for very small coefficient matrices because library-call and sparse-format overhead can dominate.
