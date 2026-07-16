@@ -1,1 +1,0 @@
-/usr/bin/nvcc -forward-unknown-to-host-compiler  -DNDEBUG -O0 "--generate-code=arch=compute_80,code=[compute_80,sm_80]" -Xcompiler=-fPIC -Wno-deprecated-gpu-targets -shared -dlink --options-file CMakeFiles/tact_bench.dir/deviceObjects1.rsp -o CMakeFiles/tact_bench.dir/cmake_device_link.o --options-file CMakeFiles/tact_bench.dir/deviceLinkLibs.rsp -L"/lib/x86_64-linux-gnu"

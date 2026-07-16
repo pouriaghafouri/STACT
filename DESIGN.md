@@ -1,45 +1,65 @@
-# TACT project design notes
+# TACT design notes
 
-The project is split by execution engine:
+## Components
 
-- `src/baseline_engine.cu`: dispatch for scalar baseline kernels.
-- `src/historical_sfu_kernels.cu`: old 64-thread SFU stress kernels, compiled
-  with `--use_fast_math`.
-- `src/historical_sp_kernels.cu`: old 64-thread standard-libdevice SP stress
-  kernels, compiled without fast math.
-- `src/wmma_engine.cu`: dense WMMA Tensor Core path.
-- `src/cusparse_engine.cu`: generic sparse CSR coefficient matrix multiplied by a dense power matrix.
-- `src/cusparselt_engine.cu`: 2:4 structured-sparse Tensor Core path using cuSPARSELt.
-- `src/device_kernels.cu`: shared CUDA kernels for power-matrix construction and post-processing.
-- `src/matrix_builders.cu`: coefficient matrix construction and sparse layouts.
-- `src/runner.cu`: benchmark orchestration, timing, and validation.
+- `src/sfu_kernels.cu`: SFU clean and TACT scalar kernels; this is the only
+  translation unit compiled with `--use_fast_math`.
+- `src/sp_kernels.cu`: standard single-precision clean and TACT scalar kernels.
+- `src/scalar_engine.cu`: SFU/SP engine dispatch and profiling.
+- `src/wmma_engine.cu`: dense Tensor Core engine and coefficient ownership.
+- `src/cusparse_engine.cu`: generic sparse CSR matrix engine.
+- `src/cusparselt_engine.cu`: 2:4 structured-sparse Tensor Core engine.
+- `src/matrix_builders.cu`: canonical coefficient matrix and CSR conversion.
+- `src/device_kernels.cu`: WMMA, power construction, and post-processing.
+- `src/runner.cu`: transfers, timing, validation, and debug output.
 
-For every timed iteration, the benchmark measures input HtoD, the full engine
-kernel phase, and output DtoH separately. For matrix engines the kernel phase
-includes power-matrix construction and post-processing, not just the multiply.
-Static setup and compression are reported separately as `init ms`.
-Historical triple DtoH uses three synchronous copies in the same order as the
-old programs: cosine/D, sine, then tangent.
+## One logical matrix product
 
-The `sparse24` K layout permutes the power positions so each logical coefficient column has at most two nonzeros in every group of four K entries. The same K permutation is applied to the power matrix and the coefficient matrix, so the mathematical result is unchanged.
+`buildCoefficientLayout` is the sole coefficient-construction path. It returns
+canonical row-major `B[K,16]`, physical `B24[K,16]`, and a complete K-row
+permutation. All engines compute the same product using different physical
+representations:
 
-## Reference layout and compatibility behavior
+| Engine | Physical coefficient representation | Product |
+|---|---|---|
+| WMMA | physical dense `B[K,16]` | `A * B` |
+| cuSPARSE | `CSR(Bphysical^T)[16,K]` | `Bphysical^T * Aphysical^T` |
+| cuSPARSELt | structured row-major `B24[K,16]`, `opA=T` | `B24^T * A24^T` |
 
-The files in `tact/` are treated as historical source material. Their two core layouts are:
+`ProblemSpec::positions` maps each `(input slot, term)` to K. Dense mode uses
+sequential positions. The 2:4 mode permutes them so each coefficient column has
+at most two nonzeros per four K elements. Power construction uses the same map,
+making the permutation algebraically neutral.
 
-- Single cosine: one warp owns a 16x16 A tile; each row packs five inputs, with three powers per input at K positions `(3s,3s+1,3s+2)`. B places the three cosine coefficients in the corresponding K rows and slot column. One warp therefore covers 80 inputs.
-- Triple sin/cos/tan: A uses the same five-input, three-power packing. B uses physical column groups `cos`, `sin`, then `tan`. Sine and tangent multiply the MMA result by the original input during writeback.
+Debug mode constructs logical and physical A/B side by side, evaluates both
+dot products, prints the full permutation, and reports their maximum difference.
 
-The old WMMA accumulator starts at `1.0f` and executes the same MMA 2000 times.
-The old scalar kernels also execute 2000 chained operations and retain their
-global stores inside every stress iteration. Their triple ordering is not the
-same: SFU does `sin`, `D=cos`, `tan(updated D)`, while SP does `sin`, `tan`,
-`D=cos`. Historical kernels use 64-thread blocks. The build retains the old
-SFU-only fast-math split, CUDA `-O0`, SM86 default, and non-RDC compilation;
-the resulting triple resource profiles match the old binaries (SFU: 18
-registers, SP: 31 registers, neither with a stack frame). These are stress and
-timing semantics rather than a one-pass function approximation. The modular
-benchmark selects these semantics automatically for historical cosine and
-triple SFU/SP/WMMA comparisons; `--tact-reference` selects them explicitly,
-and `--clean` selects one-pass mathematical behavior. Padding is explicitly
-zeroed instead of reproducing undefined reads from old uninitialized shared memory.
+Triple fusion uses five inputs per A row and three powers per input. Coefficient
+column groups are cosine, sine, and tangent. Sine and tangent multiply their
+factored result by the original input.
+
+## TACT workload
+
+The canonical scalar kernels preserve their chained 64-thread stress loops and
+in-loop global stores. SFU performs `sin`, `D=cos`, `tan(updated D)`; SP performs
+`sin`, `tan`, `D=cos`.
+
+WMMA initializes C to one and performs `steps` repeated MMA operations. Sparse
+libraries express the identical aggregate with matmul `alpha=steps`, then the
+common post-processing adds the leading one and applies odd-function multiply.
+This avoids measuring thousands of API/kernel-launch boundaries instead of the
+sparse matrix operation itself.
+
+## Timing boundary
+
+Each measured iteration synchronously measures HtoD, complete engine execution,
+and DtoH. Matrix execution contains power construction, matrix multiplication,
+post-processing, and output writes. Static coefficient conversion, descriptors,
+compression, and workspace allocation are reported as initialization.
+
+## Scalar capability and validation
+
+SFU supports only `__expf`, `__logf`, `__sinf`, `__cosf`, and `__tanf` paths.
+Hyperbolic requests are rejected before launch. Clean validation uses SFU when
+the entire fused request is supported and otherwise selects SP, so unsupported
+SFU work is never mislabeled as an SFU reference or timing.

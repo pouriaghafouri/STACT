@@ -28,7 +28,8 @@ class Engine {
   }
 };
 
-std::unique_ptr<Engine> makeBaselineEngine(const EngineContext& ctx, bool fast);
+std::unique_ptr<Engine> makeSfuEngine(const EngineContext& ctx);
+std::unique_ptr<Engine> makeSpEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeWmmaEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeCuSparseEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeCuSparseLtEngine(const EngineContext& ctx);

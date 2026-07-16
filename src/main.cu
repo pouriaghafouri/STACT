@@ -12,8 +12,8 @@ int main(int argc, char** argv) {
     std::cout << "  terms:       " << opt.terms << "\n";
     std::cout << "  N:           " << opt.n << " input x values per engine run\n";
     std::cout << "  inner repeat:" << opt.inner_repeat << " engine run(s) per timed iteration\n";
-    if (opt.reference_compat) {
-      std::cout << "  mode:        historical TACT workload, " << opt.reference_repeat
+    if (opt.tact_mode) {
+      std::cout << "  mode:        TACT stress workload, " << opt.tact_steps
                 << " internal step(s) per engine run\n";
     } else {
       std::cout << "  mode:        clean one-pass computation\n";
@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
     std::cout << "  total min/max ms: " << r.min_ms << " / " << r.max_ms << "\n";
     if (opt.profile_sections) {
       std::cout << "  section avg ms per timed iteration:\n";
-      if (r.avg_baseline_ms > 0.0f) std::cout << "    baseline kernel: " << r.avg_baseline_ms << "\n";
+      if (r.avg_scalar_ms > 0.0f) std::cout << "    scalar kernel:   " << r.avg_scalar_ms << "\n";
       if (r.avg_fused_kernel_ms > 0.0f) std::cout << "    fused WMMA kernel: " << r.avg_fused_kernel_ms << "\n";
       if (r.avg_build_power_ms > 0.0f) std::cout << "    build power matrix: " << r.avg_build_power_ms << "\n";
       if (r.avg_matmul_ms > 0.0f) std::cout << "    matrix multiply:    " << r.avg_matmul_ms << "\n";
@@ -36,6 +36,8 @@ int main(int argc, char** argv) {
     }
     std::cout << "  throughput:  " << r.throughput_mvals_s << " Mvalues/s\n";
     if (opt.validate) {
+      std::cout << "  reference:   "
+                << (tact::allSfuSupported(opt.funcs) ? "sfu" : "sp") << "\n";
       std::cout << std::scientific << std::setprecision(3);
       std::cout << "  max abs err: " << r.max_abs << "\n";
       std::cout << "  max rel err: " << r.max_rel << "\n";

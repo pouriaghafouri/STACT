@@ -1,1 +1,0 @@
-/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/tact_bench.dir/objects1.rsp -o tact_bench @CMakeFiles/tact_bench.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

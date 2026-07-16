@@ -13,17 +13,21 @@ static void dumpDebug(std::ostream& os,
                       const std::vector<float>& ref) {
   const int rows = std::min(opt.debug_rows, (opt.n + spec.ipr - 1) / spec.ipr);
   const int values = std::min(opt.debug_values, opt.n);
-  auto b = buildCoefficientB(opt.funcs, opt.terms, spec.ipr,
-                             spec.positions, spec.output_groups);
+  auto coefficients = buildCoefficientLayout(
+      opt.funcs, opt.terms, spec.ipr, spec.positions, spec.output_groups);
 
-  std::vector<__half> a(size_t(rows) * WMMA_K, __float2half(0.0f));
+  std::vector<__half> logical_a(size_t(rows) * WMMA_K, __float2half(0.0f));
+  std::vector<__half> physical_a(size_t(rows) * WMMA_K, __float2half(0.0f));
   for (int row = 0; row < rows; ++row) {
     for (int slot = 0; slot < spec.ipr; ++slot) {
       int idx = row * spec.ipr + slot;
       if (idx >= opt.n) continue;
       for (int t = 0; t < opt.terms; ++t) {
-        int k = spec.positions[slot * opt.terms + t];
-        a[row * WMMA_K + k] = __float2half(powerFor(in[idx], t, spec.basis));
+        int logical_k = slot * opt.terms + t;
+        int physical_k = spec.positions[logical_k];
+        __half power = __float2half(powerFor(in[idx], t, spec.basis));
+        logical_a[row * WMMA_K + logical_k] = power;
+        physical_a[row * WMMA_K + physical_k] = power;
       }
     }
   }
@@ -37,6 +41,11 @@ static void dumpDebug(std::ostream& os,
     for (int t = 0; t < opt.terms; ++t) os << " k" << spec.positions[slot * opt.terms + t];
     os << '\n';
   }
+  os << "logical K -> physical K:";
+  for (int k = 0; k < WMMA_K; ++k) {
+    os << ' ' << k << "->" << coefficients.logical_to_physical[k];
+  }
+  os << '\n';
   os << "function -> coefficient-column group\n";
   for (int f = 0; f < spec.num_funcs; ++f) {
     os << "  " << functionName(opt.funcs[f]) << " -> " << spec.output_groups[f] << '\n';
@@ -45,29 +54,62 @@ static void dumpDebug(std::ostream& os,
   os << "logical Tile A / power matrix (" << rows << "x16 shown)\n";
   for (int row = 0; row < rows; ++row) {
     os << "  A[" << row << "]";
-    for (int k = 0; k < WMMA_K; ++k) os << ' ' << __half2float(a[row * WMMA_K + k]);
+    for (int k = 0; k < WMMA_K; ++k) {
+      os << ' ' << __half2float(logical_a[row * WMMA_K + k]);
+    }
     os << '\n';
   }
   os << "logical Tile B / coefficient matrix (16x16)\n";
   for (int k = 0; k < WMMA_K; ++k) {
     os << "  B[" << k << "]";
-    for (int col = 0; col < WMMA_N; ++col) os << ' ' << __half2float(b[k * WMMA_N + col]);
+    for (int col = 0; col < WMMA_N; ++col) {
+      os << ' ' << __half2float(coefficients.logical[k * WMMA_N + col]);
+    }
     os << '\n';
   }
 
+  if (opt.layout == LAYOUT_SPARSE24) {
+    os << "physical 2:4 Tile A / permuted power matrix\n";
+    for (int row = 0; row < rows; ++row) {
+      os << "  A24[" << row << "]";
+      for (int k = 0; k < WMMA_K; ++k) {
+        os << ' ' << __half2float(physical_a[row * WMMA_K + k]);
+      }
+      os << '\n';
+    }
+    os << "physical 2:4 Tile B / permuted coefficient matrix\n";
+    for (int k = 0; k < WMMA_K; ++k) {
+      os << "  B24[" << k << "]";
+      for (int col = 0; col < WMMA_N; ++col) {
+        os << ' ' << __half2float(coefficients.physical[k * WMMA_N + col]);
+      }
+      os << '\n';
+    }
+  }
+
   os << "logical Tile C / intermediate matrix (used columns)\n";
+  float max_permutation_difference = 0.0f;
   for (int row = 0; row < rows; ++row) {
     os << "  C[" << row << "]";
     for (int col = 0; col < spec.num_funcs * spec.ipr; ++col) {
-      float dot = 0.0f;
+      float logical_dot = 0.0f;
+      float physical_dot = 0.0f;
       for (int k = 0; k < WMMA_K; ++k) {
-        dot += __half2float(a[row * WMMA_K + k]) * __half2float(b[k * WMMA_N + col]);
+        logical_dot += __half2float(logical_a[row * WMMA_K + k]) *
+                       __half2float(coefficients.logical[k * WMMA_N + col]);
+        physical_dot += __half2float(physical_a[row * WMMA_K + k]) *
+                        __half2float(coefficients.physical[k * WMMA_N + col]);
       }
-      float c = opt.reference_compat ? 1.0f + opt.reference_repeat * dot : dot;
+      max_permutation_difference = std::max(
+          max_permutation_difference, std::abs(logical_dot - physical_dot));
+      float c = opt.tact_mode
+          ? 1.0f + opt.tact_steps * physical_dot : physical_dot;
       os << ' ' << c;
     }
     os << '\n';
   }
+  os << "logical/physical max dot difference: "
+     << max_permutation_difference << '\n';
 
   os << "outputs / references / absolute errors\n";
   for (int f = 0; f < spec.num_funcs; ++f) {
@@ -81,11 +123,9 @@ static void dumpDebug(std::ostream& os,
   }
 
   if (opt.engine == ENGINE_CUSPARSE) {
-    auto bt = buildCoefficientBT(opt.funcs, opt.terms, spec.ipr,
-                                 spec.positions, spec.output_groups);
     std::vector<int> row_ptr, col_ind;
     std::vector<__half> vals;
-    buildCSRFromBT(bt, row_ptr, col_ind, vals);
+    buildCoefficientCsrTranspose(coefficients.physical, row_ptr, col_ind, vals);
     os << "cuSPARSE CSR row_ptr:";
     for (int v : row_ptr) os << ' ' << v;
     os << "\ncuSPARSE CSR nonzeros (column:value):";
@@ -95,28 +135,30 @@ static void dumpDebug(std::ostream& os,
     os << '\n';
   }
   if (opt.layout == LAYOUT_SPARSE24) {
-    os << "cuSPARSELt physical structured matrix is logical B (Kx16 row-major); opA=T.\n";
-    bool valid = true;
+    os << "cuSPARSELt structured operand is physical B24 (Kx16 row-major); opA=T.\n";
     for (int col = 0; col < spec.num_funcs * spec.ipr; ++col) {
       os << "  col " << col << " 2:4 counts:";
       for (int group = 0; group < 4; ++group) {
         int count = 0;
         for (int k = group * 4; k < group * 4 + 4; ++k) {
-          if (__half2float(b[k * WMMA_N + col]) != 0.0f) ++count;
+          if (__half2float(coefficients.physical[k * WMMA_N + col]) != 0.0f) {
+            ++count;
+          }
         }
-        valid = valid && count <= 2;
         os << ' ' << count;
       }
       os << '\n';
     }
-    os << "  2:4 validity: " << (valid ? "valid" : "INVALID") << '\n';
+    os << "  2:4 validity: "
+       << (isCoefficientSparse24(coefficients.physical) ? "valid" : "INVALID")
+       << '\n';
   }
 }
 
 static std::unique_ptr<Engine> makeSelectedEngine(const Options& opt, const EngineContext& ctx) {
   switch (opt.engine) {
-    case ENGINE_BASELINE_FAST: return makeBaselineEngine(ctx, true);
-    case ENGINE_BASELINE_SP: return makeBaselineEngine(ctx, false);
+    case ENGINE_SFU: return makeSfuEngine(ctx);
+    case ENGINE_SP: return makeSpEngine(ctx);
     case ENGINE_WMMA: return makeWmmaEngine(ctx);
     case ENGINE_CUSPARSE: return makeCuSparseEngine(ctx);
     case ENGINE_CUSPARSELT: return makeCuSparseLtEngine(ctx);
@@ -152,23 +194,28 @@ RunResult runBenchmark(const Options& opt) {
                         d_positions.as<int>(), d_output_groups.as<int>()};
 
   if (opt.validate || opt.debug) {
-    auto ref_engine = makeBaselineEngine(ref_ctx, true);
+    auto ref_engine = allSfuSupported(opt.funcs)
+        ? makeSfuEngine(ref_ctx)
+        : makeSpEngine(ref_ctx);
     ref_engine->run();
     TACT_CUDA_CHECK(cudaDeviceSynchronize());
-    if (opt.reference_compat) {
+    if (opt.tact_mode) {
       int cos_output = opt.funcs.size() == 1 ? 0 : 1;
       TACT_CUDA_CHECK(cudaMemcpy(d_ref.as<float>() + size_t(cos_output) * opt.n,
                                  d_in.as<float>(), size_t(opt.n) * sizeof(float),
                                  cudaMemcpyDeviceToDevice));
     }
-    // Historical scalar reference kernels overwrite D exactly like the old
-    // programs. Restore the original input before warmup/measurement.
+    // TACT scalar kernels overwrite D. Restore the original input before
+    // warmup and measurement.
     TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
                                size_t(opt.n) * sizeof(float),
                                cudaMemcpyHostToDevice));
   }
 
+  auto init_start = std::chrono::high_resolution_clock::now();
   auto engine = makeSelectedEngine(opt, ctx);
+  TACT_CUDA_CHECK(cudaDeviceSynchronize());
+  auto init_stop = std::chrono::high_resolution_clock::now();
 
   std::vector<float> times;
   std::vector<float> h2d_times;
@@ -187,8 +234,8 @@ RunResult runBenchmark(const Options& opt) {
   }
 
   for (int i = 0; i < opt.iterations; ++i) {
-    // Match the historical TACT report: time input HtoD, the complete GPU
-    // computation, and output DtoH separately on every measured iteration.
+    // Time input HtoD, complete GPU computation, and output DtoH separately
+    // on every measured iteration.
     auto h2d_start = std::chrono::high_resolution_clock::now();
     TACT_CUDA_CHECK(cudaMemcpy(d_in.as<float>(), h_in.data(),
                                size_t(opt.n) * sizeof(float),
@@ -201,7 +248,7 @@ RunResult runBenchmark(const Options& opt) {
     for (int r = 0; r < opt.inner_repeat; ++r) {
       if (opt.profile_sections) {
         SectionTimes st = engine->runProfile();
-        iter_sections.baseline_ms += st.baseline_ms;
+        iter_sections.scalar_ms += st.scalar_ms;
         iter_sections.fused_kernel_ms += st.fused_kernel_ms;
         iter_sections.build_power_ms += st.build_power_ms;
         iter_sections.matmul_ms += st.matmul_ms;
@@ -215,15 +262,15 @@ RunResult runBenchmark(const Options& opt) {
     float kernel_ms = std::chrono::duration<float, std::milli>(kernel_stop - kernel_start).count();
 
     auto d2h_start = std::chrono::high_resolution_clock::now();
-    // TripleTranscend* performs one DtoH copy per output array. Copy planes in
-    // the same physical function-group order (cos, sin, tan for triple mode).
+    // TACT triple mode performs one DtoH copy per output array. Copy planes in
+    // physical function-group order: cosine, sine, then tangent.
     for (int group = 0; group < spec.num_funcs; ++group) {
       int output_index = 0;
       while (spec.output_groups[output_index] != group) ++output_index;
       const float* copy_source = d_out.as<float>() + size_t(output_index) * opt.n;
-      bool historical_scalar = opt.reference_compat &&
-          (opt.engine == ENGINE_BASELINE_FAST || opt.engine == ENGINE_BASELINE_SP);
-      if (historical_scalar && opt.funcs[output_index] == F_COS) {
+      bool tact_scalar = opt.tact_mode &&
+          (opt.engine == ENGINE_SFU || opt.engine == ENGINE_SP);
+      if (tact_scalar && opt.funcs[output_index] == F_COS) {
         copy_source = d_in.as<float>();
       }
       TACT_CUDA_CHECK(cudaMemcpy(h_timed_out.data() + size_t(output_index) * opt.n,
@@ -239,7 +286,7 @@ RunResult runBenchmark(const Options& opt) {
     h2d_times.push_back(h2d_ms);
     kernel_times.push_back(kernel_ms);
     d2h_times.push_back(d2h_ms);
-    section_sum.baseline_ms += iter_sections.baseline_ms;
+    section_sum.scalar_ms += iter_sections.scalar_ms;
     section_sum.fused_kernel_ms += iter_sections.fused_kernel_ms;
     section_sum.build_power_ms += iter_sections.build_power_ms;
     section_sum.matmul_ms += iter_sections.matmul_ms;
@@ -249,19 +296,16 @@ RunResult runBenchmark(const Options& opt) {
   TACT_CUDA_CHECK(cudaDeviceSynchronize());
 
   RunResult result;
-<<<<<<< HEAD
-=======
   result.init_ms = std::chrono::duration<float, std::milli>(init_stop - init_start).count();
   result.avg_h2d_ms = std::accumulate(h2d_times.begin(), h2d_times.end(), 0.0f) / float(h2d_times.size());
   result.avg_kernel_ms = std::accumulate(kernel_times.begin(), kernel_times.end(), 0.0f) / float(kernel_times.size());
   result.avg_d2h_ms = std::accumulate(d2h_times.begin(), d2h_times.end(), 0.0f) / float(d2h_times.size());
->>>>>>> e30f8f9 (Changing SFU/SP/Tensore_Core kernels according to the real TACT)
   result.avg_ms = std::accumulate(times.begin(), times.end(), 0.0f) / float(times.size());
   result.min_ms = *std::min_element(times.begin(), times.end());
   result.max_ms = *std::max_element(times.begin(), times.end());
   if (opt.profile_sections) {
     float denom = float(opt.iterations);
-    result.avg_baseline_ms = section_sum.baseline_ms / denom;
+    result.avg_scalar_ms = section_sum.scalar_ms / denom;
     result.avg_fused_kernel_ms = section_sum.fused_kernel_ms / denom;
     result.avg_build_power_ms = section_sum.build_power_ms / denom;
     result.avg_matmul_ms = section_sum.matmul_ms / denom;

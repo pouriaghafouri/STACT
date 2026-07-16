@@ -13,11 +13,12 @@ class CuSparseEngine final : public Engine {
     d_powerT_.allocate(size_t(WMMA_K) * rows_pad_ * sizeof(__half));
     d_ct_.allocate(size_t(OUT_PAD) * rows_pad_ * sizeof(float));
 
-    auto bt = buildCoefficientBT(opt.funcs, opt.terms, ctx_.spec.ipr,
-                                 ctx_.spec.positions, ctx_.spec.output_groups);
+    auto coefficients = buildCoefficientLayout(
+        opt.funcs, opt.terms, ctx_.spec.ipr,
+        ctx_.spec.positions, ctx_.spec.output_groups);
     std::vector<int> rowPtr, colInd;
     std::vector<__half> vals;
-    buildCSRFromBT(bt, rowPtr, colInd, vals);
+    buildCoefficientCsrTranspose(coefficients.physical, rowPtr, colInd, vals);
     d_rowPtr_.allocate(rowPtr.size() * sizeof(int));
     d_colInd_.allocate(colInd.size() * sizeof(int));
     d_vals_.allocate(vals.size() * sizeof(__half));
@@ -57,7 +58,8 @@ class CuSparseEngine final : public Engine {
     launchBuildPowerT(ctx_.d_in, d_powerT_.as<__half>(), ctx_.opt->n, rows_pad_,
                       ctx_.opt->terms, ctx_.spec.ipr, ctx_.spec.basis,
                       ctx_.d_positions, stream);
-    const float alpha = 1.0f;
+    const float alpha = ctx_.opt->tact_mode
+        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
     const float beta = 0.0f;
     TACT_CUSPARSE_CHECK(cusparseSpMM(handle_,
                                      CUSPARSE_OPERATION_NON_TRANSPOSE,
@@ -67,7 +69,7 @@ class CuSparseEngine final : public Engine {
                                      d_buffer_.ptr));
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                     ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
-                    ctx_.d_output_groups, stream);
+                    ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
   }
 
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
@@ -82,7 +84,8 @@ class CuSparseEngine final : public Engine {
                       ctx_.d_positions, stream);
     st.build_power_ms += phase.toc(stream);
 
-    const float alpha = 1.0f;
+    const float alpha = ctx_.opt->tact_mode
+        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
     const float beta = 0.0f;
     phase.tic(stream);
     TACT_CUSPARSE_CHECK(cusparseSpMM(handle_,
@@ -96,7 +99,7 @@ class CuSparseEngine final : public Engine {
     phase.tic(stream);
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                     ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
-                    ctx_.d_output_groups, stream);
+                    ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
     st.postprocess_ms += phase.toc(stream);
 
     st.total_ms = total.toc(stream);

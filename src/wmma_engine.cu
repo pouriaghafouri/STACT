@@ -1,17 +1,27 @@
 #include "tact/engines.cuh"
 #include "tact/kernels.cuh"
+#include "tact/matrix_builders.cuh"
 
 namespace tact {
 namespace {
 class WmmaEngine final : public Engine {
  public:
-  explicit WmmaEngine(EngineContext ctx) : ctx_(ctx) {}
+  explicit WmmaEngine(EngineContext ctx) : ctx_(ctx) {
+    auto coefficients = buildCoefficientLayout(
+        ctx_.opt->funcs, ctx_.opt->terms, ctx_.spec.ipr,
+        ctx_.spec.positions, ctx_.spec.output_groups);
+    d_coefficients_.allocate(coefficients.physical.size() * sizeof(__half));
+    TACT_CUDA_CHECK(cudaMemcpy(d_coefficients_.as<__half>(),
+                               coefficients.physical.data(),
+                               coefficients.physical.size() * sizeof(__half),
+                               cudaMemcpyHostToDevice));
+  }
   void run(cudaStream_t stream = nullptr) override {
     launchWmma(ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                ctx_.spec.num_funcs, ctx_.opt->n, ctx_.opt->terms,
                ctx_.spec.ipr, ctx_.spec.basis, ctx_.d_positions,
-               ctx_.d_output_groups, ctx_.opt->reference_compat,
-               ctx_.opt->reference_repeat, stream);
+               ctx_.d_output_groups, d_coefficients_.as<__half>(),
+               ctx_.opt->tact_mode, ctx_.opt->tact_steps, stream);
   }
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
     SectionTimes st;
@@ -24,6 +34,7 @@ class WmmaEngine final : public Engine {
   }
  private:
   EngineContext ctx_;
+  DeviceBuffer d_coefficients_;
 };
 }  // namespace
 

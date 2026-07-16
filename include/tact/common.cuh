@@ -93,8 +93,8 @@ enum LayoutKind : int {
 };
 
 enum EngineKind : int {
-  ENGINE_BASELINE_FAST = 0,
-  ENGINE_BASELINE_SP = 1,
+  ENGINE_SFU = 0,
+  ENGINE_SP = 1,
   ENGINE_WMMA = 2,
   ENGINE_CUSPARSE = 3,
   ENGINE_CUSPARSELT = 4
@@ -119,8 +119,8 @@ struct Options {
   bool validate = true;
   bool print_layout = false;
   bool profile_sections = true;
-  bool reference_compat = false;
-  int reference_repeat = 2000;
+  bool tact_mode = false;
+  int tact_steps = 2000;
   bool debug = false;
   int debug_values = 8;
   int debug_rows = 2;
@@ -140,7 +140,7 @@ struct ProblemSpec {
 
 struct SectionTimes {
   float total_ms = 0.0f;
-  float baseline_ms = 0.0f;
+  float scalar_ms = 0.0f;
   float fused_kernel_ms = 0.0f;
   float build_power_ms = 0.0f;
   float matmul_ms = 0.0f;
@@ -155,7 +155,7 @@ struct RunResult {
   float avg_ms = 0.0f;
   float min_ms = 0.0f;
   float max_ms = 0.0f;
-  float avg_baseline_ms = 0.0f;
+  float avg_scalar_ms = 0.0f;
   float avg_fused_kernel_ms = 0.0f;
   float avg_build_power_ms = 0.0f;
   float avg_matmul_ms = 0.0f;
@@ -232,6 +232,8 @@ Options parseArgs(int argc, char** argv);
 
 bool isEvenGroup(FunctionId f);
 bool isMixedGroup(FunctionId f);
+bool isSfuSupported(FunctionId f);
+bool allSfuSupported(const std::vector<FunctionId>& funcs);
 BasisKind determineBasis(const std::vector<FunctionId>& funcs);
 int inputsPerRow(int terms, int num_funcs);
 int roundUp(int x, int a);

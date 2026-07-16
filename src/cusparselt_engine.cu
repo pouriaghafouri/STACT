@@ -40,10 +40,18 @@ class CuSparseLtEngine final : public Engine {
     // with opA=T and opB=T. The physical sparse A is K x N, so opA(A) is the
     // logical coefficient matrix B^T: N x K. This avoids the NOT_SUPPORTED /
     // operation-not-permitted descriptor combination hit by row-major NN.
-    auto b = buildCoefficientB(opt.funcs, opt.terms, ctx_.spec.ipr,
-                               ctx_.spec.positions, ctx_.spec.output_groups);
+    auto coefficients = buildCoefficientLayout(
+        opt.funcs, opt.terms, ctx_.spec.ipr,
+        ctx_.spec.positions, ctx_.spec.output_groups);
+    if (!isCoefficientSparse24(coefficients.physical)) {
+      throw std::runtime_error(
+          "Generated physical coefficient matrix violates 2:4 sparsity.");
+    }
     d_sparseA_.allocate(size_t(WMMA_K) * OUT_PAD * sizeof(__half));
-    TACT_CUDA_CHECK(cudaMemcpy(d_sparseA_.as<__half>(), b.data(), b.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    TACT_CUDA_CHECK(cudaMemcpy(d_sparseA_.as<__half>(),
+                               coefficients.physical.data(),
+                               coefficients.physical.size() * sizeof(__half),
+                               cudaMemcpyHostToDevice));
 
     TACT_CUSPARSELT_CHECK(cusparseLtInit(&handle_));
     constexpr int alignment = 16;
@@ -142,7 +150,8 @@ class CuSparseLtEngine final : public Engine {
   }
 
   void run(cudaStream_t stream = nullptr) override {
-    const float alpha = 1.0f;
+    const float alpha = ctx_.opt->tact_mode
+        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
     const float beta = 0.0f;
     cudaStream_t streams[1] = {stream};
     int processed = 0;
@@ -162,14 +171,15 @@ class CuSparseLtEngine final : public Engine {
       launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
                           ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
                           processed, chunk_rows_pad_, ctx_.spec.ipr,
-                          ctx_.d_output_groups, stream);
+                          ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
       processed += chunk_rows_pad_;
     }
   }
 
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
     SectionTimes st;
-    const float alpha = 1.0f;
+    const float alpha = ctx_.opt->tact_mode
+        ? static_cast<float>(ctx_.opt->tact_steps) : 1.0f;
     const float beta = 0.0f;
     cudaStream_t streams[1] = {stream};
     GpuTimer total, phase;
@@ -198,7 +208,7 @@ class CuSparseLtEngine final : public Engine {
       launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
                           ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
                           processed, chunk_rows_pad_, ctx_.spec.ipr,
-                          ctx_.d_output_groups, stream);
+                          ctx_.d_output_groups, ctx_.opt->tact_mode, stream);
       st.postprocess_ms += phase.toc(stream);
       processed += chunk_rows_pad_;
     }

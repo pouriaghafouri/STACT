@@ -1,1 +1,0 @@
-  -L/path/to/cusparselt/lib  -L/path/to/cusparselt/lib64   -lcusparseLt -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

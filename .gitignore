@@ -1,5 +1,34 @@
-build
-build-slt
-results.csv
-throughput.png
-avg_ms.png
+# CMake and CUDA build trees
+/build/
+/build-*/
+/cmake-build-*/
+/compile_commands.json
+
+# Compiled reference programs (keep the matching tact/*.cu sources)
+/tact/cosine_tensor_core
+/tact/cosine_SFU
+/tact/cosine_SP
+/tact/TripleTranscendCore
+/tact/TripleTranscendSFU
+/tact/TripleTranscendSP
+/tact/TranscendTCore_ExpoLog
+/tact/ExpoLog_SFU
+/tact/ExpoLog_SP
+
+# Benchmark output
+/results/
+/results.csv
+/benchmark_results.csv
+/throughput.png
+/avg_ms.png
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local editor and operating-system files
+/.vscode/
+/.idea/
+.DS_Store
+*~

@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-out=${1:-"$root/build-reference"}
-mkdir -p "$out"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+SOURCE_DIR=${SOURCE_DIR:-$ROOT/tact}
+OUTDIR=${1:-$ROOT/build-reference}
+ARCH=${ARCH:-sm_86}
 
-# Keep these at -O0 and preserve the distinct compiler modes used by the old
-# experiments: only SFU sources receive --use_fast_math.
-nvcc -O0 -arch=sm_86 "$root/tact/cosine_tensor_core.cu" -o "$out/cosine_tensor_core"
-nvcc -O0 -arch=sm_86 "$root/tact/TripleTranscendCore.cu" -o "$out/TripleTranscendCore"
-nvcc -O0 -arch=sm_86 --use_fast_math "$root/tact/cosine_SFU.cu" -o "$out/cosine_SFU"
-nvcc -O0 -arch=sm_86 --use_fast_math "$root/tact/TripleTranscendSFU.cu" -o "$out/TripleTranscendSFU"
-nvcc -O0 -arch=sm_86 "$root/tact/cosine_SP.cu" -o "$out/cosine_SP"
-nvcc -O0 -arch=sm_86 "$root/tact/TripleTranscendSP.cu" -o "$out/TripleTranscendSP"
+mkdir -p "$OUTDIR"
 
-echo "Reference binaries written to $out"
+compile() {
+  local source=$1 output=$2
+  shift 2
+  if [[ ! -f "$SOURCE_DIR/$source" ]]; then
+    echo "missing reference source: $SOURCE_DIR/$source" >&2
+    return 1
+  fi
+  nvcc -O0 -arch="$ARCH" "$@" "$SOURCE_DIR/$source" -o "$OUTDIR/$output"
+}
+
+compile cosine_tensor_core.cu cosine_tensor_core
+compile TripleTranscendCore.cu TripleTranscendCore
+compile cosine_SFU.cu cosine_SFU --use_fast_math
+compile TripleTranscendSFU.cu TripleTranscendSFU --use_fast_math
+compile cosine_SP.cu cosine_SP
+compile TripleTranscendSP.cu TripleTranscendSP
+
+echo "Reference binaries written to $OUTDIR"
