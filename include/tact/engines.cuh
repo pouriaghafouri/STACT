@@ -36,6 +36,5 @@ std::unique_ptr<Engine> makeSfuEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeSpEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeWmmaEngine(const EngineContext& ctx);
 std::unique_ptr<Engine> makeCuSparseEngine(const EngineContext& ctx);
-std::unique_ptr<Engine> makeCuSparseLtEngine(const EngineContext& ctx);
 
 }  // namespace tact

@@ -4,26 +4,25 @@
 namespace tact {
 
 struct CoefficientLayout {
-  // Canonical dense TACT matrix B[K,16] with sequential logical K rows.
+  // Canonical dense TACT coefficient matrix B[K,16].
   std::vector<__half> logical;
-  // Physical B after applying the paired K permutation used by power matrix A.
+  // Physical view used by matrix engines; currently identical to logical.
   std::vector<__half> physical;
-  // Full bijection: logical K row -> physical K row.
   std::vector<int> logical_to_physical;
 };
 
-// The single source of truth for every matrix engine. Dense mode produces an
-// identity permutation. sparse24 mode preserves logical B while distributing
-// its physical K rows into a 2:4-compatible arrangement.
+// The single source of truth for WMMA and cuSPARSE coefficient matrices.
 CoefficientLayout buildCoefficientLayout(
     const std::vector<FunctionId>& funcs, int terms, int ipr,
     const std::vector<int>& physical_positions,
     const std::vector<int>& output_groups);
 
-bool isCoefficientSparse24(const std::vector<__half>& physical_b);
 
-// Build CSR(B^T), shape 16 x K, for cuSPARSE's B^T * A^T formulation.
+// Build the used submatrix of CSR(B^T) for cuSPARSE's B^T * A^T
+// formulation. output_rows and k_rows omit zero-only padding rows/columns.
 void buildCoefficientCsrTranspose(const std::vector<__half>& b,
+                                  int output_rows,
+                                  int k_rows,
                                   std::vector<int>& row_ptr,
                                   std::vector<int>& col_ind,
                                   std::vector<__half>& values);

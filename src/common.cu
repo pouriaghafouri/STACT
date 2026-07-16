@@ -31,13 +31,16 @@ std::string engineName(EngineKind e) {
     case ENGINE_SP: return "sp";
     case ENGINE_WMMA: return "wmma";
     case ENGINE_CUSPARSE: return "cusparse";
-    case ENGINE_CUSPARSELT: return "cusparselt";
   }
   return "unknown";
 }
 
-std::string layoutName(LayoutKind l) {
-  return l == LAYOUT_DENSE ? "dense" : "sparse24";
+std::string layoutName(LayoutKind layout) {
+  switch (layout) {
+    case LAYOUT_DENSE: return "dense";
+    case LAYOUT_CSR: return "csr";
+  }
+  return "unknown";
 }
 
 static std::string lower(std::string s) {
@@ -74,15 +77,17 @@ EngineKind parseEngine(const std::string& raw) {
   if (s == "sp" || s == "libdevice" || s == "baseline_sp") return ENGINE_SP;
   if (s == "wmma" || s == "tensor" || s == "dense") return ENGINE_WMMA;
   if (s == "cusparse") return ENGINE_CUSPARSE;
-  if (s == "cusparselt" || s == "sparselt") return ENGINE_CUSPARSELT;
   throw std::runtime_error("Unknown engine: " + raw);
 }
 
 LayoutKind parseLayout(const std::string& raw) {
   std::string s = lower(raw);
-  if (s == "dense" || s == "sequential" || s == "normal") return LAYOUT_DENSE;
-  if (s == "sparse24" || s == "2:4" || s == "24" || s == "cusparselt") return LAYOUT_SPARSE24;
-  throw std::runtime_error("Unknown layout: " + raw);
+  if (s == "dense" || s == "sequential" || s == "normal") {
+    return LAYOUT_DENSE;
+  }
+  if (s == "csr" || s == "sparse") return LAYOUT_CSR;
+  throw std::runtime_error(
+      "Unknown layout: " + raw + ". Use dense for WMMA or csr for cuSPARSE.");
 }
 
 bool isEvenGroup(FunctionId f) {
@@ -110,7 +115,7 @@ BasisKind determineBasis(const std::vector<FunctionId>& funcs) {
 
 int inputsPerRow(int terms, int num_funcs) {
   if (terms < 1 || terms > 8) {
-    throw std::runtime_error("terms must be in [1,8]. K=16 and 2:4 supports at most 8 nonzeros per logical output column.");
+    throw std::runtime_error("terms must be in [1,8] for the fixed K=16 TACT tile.");
   }
   int by_k = WMMA_K / terms;
   int by_n = WMMA_N / num_funcs;
@@ -122,55 +127,19 @@ int inputsPerRow(int terms, int num_funcs) {
 int roundUp(int x, int a) { return ((x + a - 1) / a) * a; }
 
 std::vector<int> makePositions(int terms, int ipr, LayoutKind layout) {
-  if (terms * ipr > WMMA_K) throw std::runtime_error("terms * inputs_per_row exceeds K=16");
-  std::vector<int> pos(ipr * terms, -1);
-  if (layout == LAYOUT_DENSE) {
-    for (int s = 0; s < ipr; ++s) {
-      for (int t = 0; t < terms; ++t) pos[s * terms + t] = s * terms + t;
-    }
-    return pos;
+  if (layout != LAYOUT_DENSE && layout != LAYOUT_CSR) {
+    throw std::runtime_error("Only dense and CSR layouts are supported.");
   }
-
-  // Deterministic 2:4-friendly K permutation. Each logical output column (one
-  // input slot) may have at most two nonzeros in every contiguous group of four
-  // K entries. We offset the group sequence per slot so extra terms are spread
-  // across the four 2:4 groups rather than overloading group 0.
-  int next_in_group[4] = {0, 0, 0, 0};
-  int per_slot_group[64] = {0};  // ipr <= 16, four groups per slot.
-  for (int s = 0; s < ipr; ++s) {
-    for (int t = 0; t < terms; ++t) {
-      int chosen = -1;
-      for (int attempt = 0; attempt < 4; ++attempt) {
-        int g = (s + t + attempt) & 3;
-        if (per_slot_group[s * 4 + g] >= 2) continue;
-        if (next_in_group[g] >= 4) continue;
-        chosen = g;
-        break;
-      }
-      if (chosen < 0) {
-        throw std::runtime_error("Could not build a 2:4-valid K layout for this terms/input packing.");
-      }
-      int k = chosen * 4 + next_in_group[chosen]++;
-      per_slot_group[s * 4 + chosen]++;
-      pos[s * terms + t] = k;
+  if (terms * ipr > WMMA_K) {
+    throw std::runtime_error("terms * inputs_per_row exceeds K=16");
+  }
+  std::vector<int> positions(ipr * terms, -1);
+  for (int slot = 0; slot < ipr; ++slot) {
+    for (int term = 0; term < terms; ++term) {
+      positions[slot * terms + term] = slot * terms + term;
     }
   }
-  checkSparse24(pos, terms, ipr);
-  return pos;
-}
-
-void checkSparse24(const std::vector<int>& pos, int terms, int ipr) {
-  for (int s = 0; s < ipr; ++s) {
-    int counts[4] = {0,0,0,0};
-    for (int t = 0; t < terms; ++t) {
-      int k = pos[s * terms + t];
-      if (k < 0 || k >= 16) throw std::runtime_error("invalid K position");
-      counts[k / 4]++;
-    }
-    for (int g = 0; g < 4; ++g) {
-      if (counts[g] > 2) throw std::runtime_error("2:4 violation in generated layout");
-    }
-  }
+  return positions;
 }
 
 ProblemSpec makeProblemSpec(const Options& opt) {
@@ -206,7 +175,6 @@ ProblemSpec makeProblemSpec(const Options& opt) {
   for (int group = 0; group < spec.num_funcs; ++group) {
     spec.output_groups[order[group]] = group;
   }
-  if (opt.layout == LAYOUT_SPARSE24) checkSparse24(spec.positions, opt.terms, spec.ipr);
   return spec;
 }
 
@@ -236,8 +204,7 @@ std::vector<float> makeInputs(const Options& opt, BasisKind basis) {
   if (!opt.min_set && !opt.max_set) {
     std::vector<float> h(opt.n);
     bool matrix_engine = opt.engine == ENGINE_WMMA ||
-                         opt.engine == ENGINE_CUSPARSE ||
-                         opt.engine == ENGINE_CUSPARSELT;
+                         opt.engine == ENGINE_CUSPARSE;
     if (matrix_engine) {
       // TACT matrix engines use the Tensor Core reference initialization.
       std::fill(h.begin(), h.end(), opt.funcs.size() == 1 ? 5.0f : 1.0f);
@@ -315,6 +282,7 @@ RunResult computeValidation(const std::vector<float>& out,
 
 Options parseArgs(int argc, char** argv) {
   Options opt;
+  bool layout_set = false;
   auto need = [&](int& i) -> std::string {
     if (i + 1 >= argc) {
       throw std::runtime_error(std::string("Missing value for ") + argv[i]);
@@ -325,7 +293,10 @@ Options parseArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--engine") opt.engine = parseEngine(need(i));
-    else if (a == "--layout") opt.layout = parseLayout(need(i));
+    else if (a == "--layout") {
+      opt.layout = parseLayout(need(i));
+      layout_set = true;
+    }
     else if (a == "--functions" || a == "--funcs") {
       opt.funcs.clear();
       for (const auto& item : split(need(i), ',')) {
@@ -342,8 +313,6 @@ Options parseArgs(int argc, char** argv) {
     else if (a == "--min") { opt.xmin = std::stof(need(i)); opt.min_set = true; }
     else if (a == "--max") { opt.xmax = std::stof(need(i)); opt.max_set = true; }
     else if (a == "--csv") opt.csv_path = need(i);
-    else if (a == "--validate") opt.validate = true;
-    else if (a == "--no-validate") opt.validate = false;
     else if (a == "--profile-sections") opt.profile_sections = true;
     else if (a == "--no-profile-sections") opt.profile_sections = false;
     else if (a == "--print-layout") opt.print_layout = true;
@@ -363,13 +332,14 @@ Options parseArgs(int argc, char** argv) {
     } else if (a == "--help" || a == "-h") {
       std::cout <<
         "TACT benchmark (original stress workload only)\n"
-        "  --engine sfu|sp|wmma|cusparse|cusparselt\n"
+        "  --engine sfu|sp|wmma|cusparse\n"
         "  --functions cos | sin,cos | sin,cos,tan | sin,cos,tan,sinh\n"
-        "  --terms <1..8> --layout dense|sparse24\n"
+        "  --terms <1..8> --layout dense|csr\n"
         "  --n <count> --warmup <k> --iterations <k>\n"
         "  --stress-repeat <k>  (default 2000; core operation only)\n"
         "  --threshold <eps> --min <x> --max <x> --csv results.csv\n"
-        "  --validate | --no-validate --profile-sections | --no-profile-sections\n"
+        "  validation is always enabled\n"
+        "  --profile-sections | --no-profile-sections\n"
         "  --print-layout --debug [--debug-values <k>] [--debug-rows <k>]\n";
       std::exit(0);
     } else {
@@ -390,6 +360,15 @@ Options parseArgs(int argc, char** argv) {
       opt.stress_repeat <= 0 || opt.debug_values <= 0 || opt.debug_rows <= 0) {
     throw std::runtime_error(
         "Invalid n/warmup/iterations/stress-repeat/debug count.");
+  }
+
+  if (opt.engine == ENGINE_CUSPARSE) {
+    if (!layout_set) opt.layout = LAYOUT_CSR;
+    if (opt.layout != LAYOUT_CSR) {
+      throw std::runtime_error("cuSPARSE requires --layout csr.");
+    }
+  } else if (opt.layout != LAYOUT_DENSE) {
+    throw std::runtime_error("SP, SFU, and WMMA require --layout dense.");
   }
 
   const bool single = opt.funcs == std::vector<FunctionId>{F_COS};
@@ -435,7 +414,8 @@ void appendCsv(const std::string& path, const Options& opt, const RunResult& r) 
            "avg_h2d_ms,avg_kernel_ms,avg_d2h_ms,avg_ms,min_ms,max_ms,"
            "avg_scalar_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,"
            "avg_postprocess_ms,avg_profiled_ms,throughput_mvalues_s,max_abs,"
-           "max_rel,failures,threshold\n";
+           "max_rel,failures,validated_outputs,parity_max_abs,parity_max_rel,"
+           "parity_failures,threshold\n";
   }
   out << engineName(opt.engine) << ','
       << layoutName(opt.layout) << ','
@@ -450,7 +430,9 @@ void appendCsv(const std::string& path, const Options& opt, const RunResult& r) 
       << r.avg_build_power_ms << ',' << r.avg_matmul_ms << ','
       << r.avg_postprocess_ms << ',' << r.avg_profiled_ms << ','
       << r.throughput_mvals_s << ',' << r.max_abs << ',' << r.max_rel << ','
-      << r.failures << ',' << opt.threshold << "\n";
+      << r.failures << ',' << r.validated_outputs << ','
+      << r.parity_max_abs << ',' << r.parity_max_rel << ','
+      << r.parity_failures << ',' << opt.threshold << "\n";
 }
 
 }  // namespace tact

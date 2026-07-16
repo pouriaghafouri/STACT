@@ -11,8 +11,13 @@ int main(int argc, char** argv) {
     std::cout << "  functions:     " << tact::functionListName(opt.funcs) << "\n";
     std::cout << "  terms:         " << opt.terms << "\n";
     std::cout << "  N:             " << opt.n << " input values\n";
-    std::cout << "  stress repeat: " << opt.stress_repeat
-              << " core-operation repetitions\n";
+    std::cout << "  stress repeat: " << opt.stress_repeat;
+    if (opt.engine == tact::ENGINE_CUSPARSE) {
+      std::cout << " effective algebraic repetitions\n";
+    } else {
+      std::cout << " core-operation repetitions";
+    }
+    std::cout << "\n";
 
     const bool canonical_single =
         opt.funcs.size() == 1 && opt.funcs[0] == tact::F_COS;
@@ -28,9 +33,8 @@ int main(int argc, char** argv) {
     } else if (opt.engine == tact::ENGINE_WMMA) {
       std::cout << "  kernel path:   generalized old-TACT WMMA tile\n";
     } else if (opt.engine == tact::ENGINE_CUSPARSE) {
-      std::cout << "  kernel path:   cuSPARSE CSR(B^T) * A^T\n";
-    } else if (opt.engine == tact::ENGINE_CUSPARSELT) {
-      std::cout << "  kernel path:   cuSPARSELt 2:4 B^T * A^T\n";
+      std::cout << "  kernel path:   cuSPARSE CSR(B^T) * A^T, "
+                   "algebraically collapsed stress\n";
     }
 
     std::cout << "  outputs/it:    " << r.timed_outputs << " function values\n";
@@ -51,29 +55,41 @@ int main(int argc, char** argv) {
       if (r.avg_build_power_ms > 0.0f)
         std::cout << "    build/init C:  " << r.avg_build_power_ms << "\n";
       if (r.avg_matmul_ms > 0.0f)
-        std::cout << "    repeated matmul: " << r.avg_matmul_ms << "\n";
+        std::cout << "    sparse matmul:  " << r.avg_matmul_ms << "\n";
       if (r.avg_postprocess_ms > 0.0f)
         std::cout << "    postprocess:   " << r.avg_postprocess_ms << "\n";
       std::cout << "    profile-pass total: " << r.avg_profiled_ms << "\n";
     }
 
     std::cout << "  throughput:    " << r.throughput_mvals_s << " Mvalues/s\n";
-    if (opt.validate) {
-      std::cout << std::scientific << std::setprecision(3);
-      std::cout << "  max abs err:   " << r.max_abs << "\n";
-      std::cout << "  max rel err:   " << r.max_rel << "\n";
-      std::cout << "  failures:      " << r.failures
+    std::cout << std::scientific << std::setprecision(3);
+    std::cout << "  validation:    ALWAYS ON ("
+              << r.validated_outputs << " output values checked)\n";
+    if (opt.engine == tact::ENGINE_SP || opt.engine == tact::ENGINE_SFU) {
+      std::cout << "  validation ref: full deterministic device replay\n";
+    } else {
+      std::cout << "  validation ref: independent host FP16-rounded TACT model\n";
+    }
+    std::cout << "  max abs err:   " << r.max_abs << "\n";
+    std::cout << "  max rel err:   " << r.max_rel << "\n";
+    std::cout << "  failures:      " << r.failures
+              << " @ threshold " << opt.threshold << "\n";
+    for (size_t i = 0; i < opt.funcs.size(); ++i) {
+      std::cout << "    " << tact::functionName(opt.funcs[i])
+                << ": max_abs=" << r.func_max_abs[i]
+                << ", max_rel=" << r.func_max_rel[i]
+                << ", failures=" << r.func_failures[i] << "\n";
+    }
+    if (opt.engine == tact::ENGINE_CUSPARSE) {
+      std::cout << "  cuSPARSE/WMMA parity:\n";
+      std::cout << "    max abs err: " << r.parity_max_abs << "\n";
+      std::cout << "    max rel err: " << r.parity_max_rel << "\n";
+      std::cout << "    failures:    " << r.parity_failures
                 << " @ threshold " << opt.threshold << "\n";
-      for (size_t i = 0; i < opt.funcs.size(); ++i) {
-        std::cout << "    " << tact::functionName(opt.funcs[i])
-                  << ": max_abs=" << r.func_max_abs[i]
-                  << ", max_rel=" << r.func_max_rel[i]
-                  << ", failures=" << r.func_failures[i] << "\n";
-      }
     }
 
     if (!opt.csv_path.empty()) tact::appendCsv(opt.csv_path, opt, r);
-    return r.failures == 0 ? 0 : 2;
+    return (r.failures == 0 && r.parity_failures == 0) ? 0 : 2;
   } catch (const tact::UnsupportedError& e) {
     std::cerr << "Unsupported: " << e.what() << "\n";
     return 3;

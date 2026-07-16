@@ -269,22 +269,10 @@ __global__ void fillFloatOnesKernel(float* values, size_t count) {
   if (idx < count) values[idx] = 1.0f;
 }
 
-__global__ void fillHalfOnesKernel(__half* values, size_t count) {
-  const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx < count) values[idx] = __float2half(1.0f);
-}
-
 void launchFillFloatOnes(float* d_values, size_t count, cudaStream_t stream) {
   constexpr int block = 256;
   const int grid = int((count + block - 1) / block);
   fillFloatOnesKernel<<<grid, block, 0, stream>>>(d_values, count);
-  TACT_CUDA_CHECK(cudaGetLastError());
-}
-
-void launchFillHalfOnes(__half* d_values, size_t count, cudaStream_t stream) {
-  constexpr int block = 256;
-  const int grid = int((count + block - 1) / block);
-  fillHalfOnesKernel<<<grid, block, 0, stream>>>(d_values, count);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -302,10 +290,12 @@ void launchWmma(const float* d_in, float* d_out, const int* d_funcs,
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
-void launchBuildPowerT(const float* d_in, __half* d_pT, int n, int rows_pad,
-                       int terms, int ipr, BasisKind basis,
-                       const int* d_positions, cudaStream_t stream) {
-  TACT_CUDA_CHECK(cudaMemsetAsync(d_pT, 0, size_t(WMMA_K) * rows_pad * sizeof(__half), stream));
+void launchBuildPowerT(const float* d_in, __half* d_pT, int n,
+                       int rows_pad, int k_rows, int terms, int ipr,
+                       BasisKind basis, const int* d_positions,
+                       cudaStream_t stream) {
+  TACT_CUDA_CHECK(cudaMemsetAsync(
+      d_pT, 0, size_t(k_rows) * rows_pad * sizeof(__half), stream));
   int block = 256;
   int grid = (n + block - 1) / block;
   buildPowerMatrixTransposeKernel<<<grid, block, 0, stream>>>(d_in, d_pT, n, rows_pad, terms, ipr, basis, d_positions);
@@ -321,84 +311,6 @@ void launchPostFloat(const float* d_ct, const float* d_in, float* d_out,
   postprocessTransposeFloatKernel<<<grid, block, 0, stream>>>(
       d_ct, d_in, d_out, d_funcs, num_funcs, n, rows_pad, ipr,
       d_output_groups);
-  TACT_CUDA_CHECK(cudaGetLastError());
-}
-
-}  // namespace tact
-
-namespace tact {
-
-__global__ void buildPowerRowsChunkKernel(const float* __restrict__ in,
-                                          __half* __restrict__ pRows,
-                                          int n,
-                                          int row_start,
-                                          int chunk_rows_pad,
-                                          int terms,
-                                          int ipr,
-                                          BasisKind basis,
-                                          const int* __restrict__ positions) {
-  int local_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int max_values = chunk_rows_pad * ipr;
-  if (local_idx >= max_values) return;
-  int local_row = local_idx / ipr;
-  int slot = local_idx % ipr;
-  int global_idx = (row_start + local_row) * ipr + slot;
-  if (global_idx >= n) return;
-  float x = in[global_idx];
-  for (int t = 0; t < terms; ++t) {
-    int k = positions[slot * terms + t];
-    pRows[local_row * WMMA_K + k] = __float2half(powerFor(x, t, basis));
-  }
-}
-
-__global__ void postprocessHalfChunkKernel(const __half* __restrict__ cT,
-                                           const float* __restrict__ in,
-                                           float* __restrict__ out,
-                                           const int* __restrict__ funcs,
-                                           int num_funcs,
-                                           int n,
-                                           int row_start,
-                                           int chunk_rows_pad,
-                                           int ipr,
-                                           const int* __restrict__ output_groups) {
-  int local_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int max_values = chunk_rows_pad * ipr;
-  if (local_idx >= max_values) return;
-  int local_row = local_idx / ipr;
-  int slot = local_idx % ipr;
-  int global_idx = (row_start + local_row) * ipr + slot;
-  if (global_idx >= n) return;
-  float x = in[global_idx];
-  for (int f = 0; f < num_funcs; ++f) {
-    FunctionId fid = static_cast<FunctionId>(funcs[f]);
-    int out_col = output_groups[f] * ipr + slot;
-    float residual = __half2float(cT[out_col * chunk_rows_pad + local_row]);
-    out[size_t(f) * n + global_idx] =
-        needsMultiplyByX(fid) ? residual * x : residual;
-  }
-}
-
-void launchBuildPowerRowsChunk(const float* d_in, __half* d_pRows, int n,
-                               int row_start, int chunk_rows_pad, int terms,
-                               int ipr, BasisKind basis, const int* d_positions,
-                               cudaStream_t stream) {
-  TACT_CUDA_CHECK(cudaMemsetAsync(d_pRows, 0, size_t(chunk_rows_pad) * WMMA_K * sizeof(__half), stream));
-  int block = 256;
-  int grid = (chunk_rows_pad * ipr + block - 1) / block;
-  buildPowerRowsChunkKernel<<<grid, block, 0, stream>>>(d_in, d_pRows, n, row_start, chunk_rows_pad, terms, ipr, basis, d_positions);
-  TACT_CUDA_CHECK(cudaGetLastError());
-}
-
-void launchPostHalfChunk(const __half* d_ct, const float* d_in, float* d_out,
-                         const int* d_funcs, int num_funcs, int n,
-                         int row_start, int chunk_rows_pad, int ipr,
-                         const int* d_output_groups,
-                         cudaStream_t stream) {
-  int block = 256;
-  int grid = (chunk_rows_pad * ipr + block - 1) / block;
-  postprocessHalfChunkKernel<<<grid, block, 0, stream>>>(
-      d_ct, d_in, d_out, d_funcs, num_funcs, n, row_start,
-      chunk_rows_pad, ipr, d_output_groups);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 

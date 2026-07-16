@@ -25,6 +25,8 @@ void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
   tact::ProblemSpec spec = tact::makeProblemSpec(options);
   tact::CoefficientLayout layout = tact::buildCoefficientLayout(
       functions, terms, spec.ipr, spec.positions, spec.output_groups);
+  const int output_rows = int(functions.size()) * spec.ipr;
+  const int k_rows = terms * spec.ipr;
 
   require(layout.logical.size() == tact::WMMA_K * tact::OUT_PAD,
           "logical coefficient shape mismatch");
@@ -61,7 +63,7 @@ void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
   for (int col = 0; col < tact::OUT_PAD; ++col) {
     float logical_dot = 0.0f;
     float physical_dot = 0.0f;
-    for (int k = 0; k < tact::WMMA_K; ++k) {
+    for (int k = 0; k < k_rows; ++k) {
       logical_dot += __half2float(logical_a[k]) *
                      __half2float(layout.logical[k * tact::OUT_PAD + col]);
       physical_dot += __half2float(physical_a[k]) *
@@ -71,31 +73,26 @@ void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
             "logical and physical coefficient products differ");
   }
 
-  if (layout_kind == tact::LAYOUT_SPARSE24) {
-    require(tact::isCoefficientSparse24(layout.physical),
-            "physical coefficient matrix is not 2:4 valid");
-  }
-
   std::vector<int> row_ptr;
   std::vector<int> col_ind;
   std::vector<__half> values;
   tact::buildCoefficientCsrTranspose(
-      layout.physical, row_ptr, col_ind, values);
-  require(row_ptr.size() == tact::OUT_PAD + 1,
+      layout.logical, output_rows, k_rows, row_ptr, col_ind, values);
+  require(row_ptr.size() == size_t(output_rows + 1),
           "CSR row pointer shape mismatch");
   require(col_ind.size() == values.size() &&
               row_ptr.back() == int(values.size()),
           "CSR nonzero metadata mismatch");
-  for (int row = 0; row < tact::OUT_PAD; ++row) {
+  for (int row = 0; row < output_rows; ++row) {
     float csr_dot = 0.0f;
     float dense_dot = 0.0f;
     for (int entry = row_ptr[row]; entry < row_ptr[row + 1]; ++entry) {
       csr_dot += __half2float(values[entry]) *
                  __half2float(physical_a[col_ind[entry]]);
     }
-    for (int k = 0; k < tact::WMMA_K; ++k) {
-      dense_dot += __half2float(layout.physical[k * tact::OUT_PAD + row]) *
-                   __half2float(physical_a[k]);
+    for (int k = 0; k < k_rows; ++k) {
+      dense_dot += __half2float(layout.logical[k * tact::OUT_PAD + row]) *
+                   __half2float(logical_a[k]);
     }
     require(csr_dot == dense_dot,
             "CSR(B^T) product differs from the physical dense product");
@@ -115,14 +112,14 @@ int main() {
   for (const auto& functions : even_cases) {
     for (int terms = 1; terms <= 8; ++terms) {
       checkCase(functions, terms, LAYOUT_DENSE);
-      checkCase(functions, terms, LAYOUT_SPARSE24);
+      checkCase(functions, terms, LAYOUT_CSR);
     }
   }
   for (int terms = 1; terms <= 8; ++terms) {
     checkCase({F_EXP}, terms, LAYOUT_DENSE);
-    checkCase({F_EXP}, terms, LAYOUT_SPARSE24);
+    checkCase({F_EXP}, terms, LAYOUT_CSR);
     checkCase({F_EXP, F_LOG1P}, terms, LAYOUT_DENSE);
-    checkCase({F_EXP, F_LOG1P}, terms, LAYOUT_SPARSE24);
+    checkCase({F_EXP, F_LOG1P}, terms, LAYOUT_CSR);
   }
 
   require(isSfuSupported(F_SIN) && isSfuSupported(F_COS) &&
@@ -154,6 +151,23 @@ int main() {
               stress_options.stress_repeat == 17 &&
               stress_options.terms == 3,
           "old-TACT-only CLI contract is incorrect");
+
+  Options sparse_options = parseOptions({
+      "tact_bench", "--engine", "cusparse", "--functions", "sin,cos,tan",
+      "--terms", "3", "--layout", "csr"});
+  require(sparse_options.engine == ENGINE_CUSPARSE &&
+              sparse_options.layout == LAYOUT_CSR,
+          "cuSPARSE CSR layout selection is incorrect");
+
+  bool validation_flag_rejected = false;
+  try {
+    (void)parseOptions({
+        "tact_bench", "--engine", "wmma", "--validate"});
+  } catch (const std::runtime_error&) {
+    validation_flag_rejected = true;
+  }
+  require(validation_flag_rejected,
+          "validation enable/disable flags must not be accepted");
 
   bool clean_rejected = false;
   try {

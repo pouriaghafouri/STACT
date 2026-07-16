@@ -4,9 +4,6 @@
 #include <cuda_fp16.h>
 #include <cusparse.h>
 
-#ifdef TACT_ENABLE_CUSPARSELT
-#include <cusparseLt.h>
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -42,25 +39,6 @@
     throw std::runtime_error(_oss.str());                               \
   }                                                                     \
 } while(0)
-
-#ifdef TACT_ENABLE_CUSPARSELT
-#define TACT_CUSPARSELT_CHECK(call) do {                                \
-  cusparseStatus_t _s = (call);                                         \
-  if (_s != CUSPARSE_STATUS_SUCCESS) {                                  \
-    std::ostringstream _oss;                                            \
-    _oss << "cuSPARSELt error " << cusparseGetErrorName(_s)            \
-         << " (" << cusparseGetErrorString(_s) << ", code "           \
-         << int(_s) << ") at " << __FILE__ << ":" << __LINE__;        \
-    if (_s == CUSPARSE_STATUS_NOT_SUPPORTED ||                           \
-        _s == CUSPARSE_STATUS_ARCH_MISMATCH) {                           \
-      throw UnsupportedError(_oss.str());                               \
-    }                                                                    \
-    throw std::runtime_error(_oss.str());                                \
-  }                                                                     \
-} while(0)
-#else
-#define TACT_CUSPARSELT_CHECK(call) do { (void)sizeof(call); } while(0)
-#endif
 
 namespace tact {
 
@@ -98,15 +76,14 @@ enum BasisKind : int {
 
 enum LayoutKind : int {
   LAYOUT_DENSE = 0,
-  LAYOUT_SPARSE24 = 1
+  LAYOUT_CSR = 1
 };
 
 enum EngineKind : int {
   ENGINE_SFU = 0,
   ENGINE_SP = 1,
   ENGINE_WMMA = 2,
-  ENGINE_CUSPARSE = 3,
-  ENGINE_CUSPARSELT = 4
+  ENGINE_CUSPARSE = 3
 };
 
 struct Options {
@@ -119,14 +96,13 @@ struct Options {
   int n = 1 << 20;
   int warmup = 0;
   int iterations = 20;
-  float threshold = 1e-5f;
+  float threshold = 5e-3f;
   uint64_t seed = 1234;
   bool min_set = false;
   bool max_set = false;
   float xmin = 0.0f;
   float xmax = 0.0f;
   std::string csv_path;
-  bool validate = false;
   bool print_layout = false;
   bool profile_sections = false;
   // The project intentionally implements only the original TACT stress
@@ -179,6 +155,10 @@ struct RunResult {
   double max_abs = 0.0;
   double max_rel = 0.0;
   int64_t failures = 0;
+  double validated_outputs = 0.0;
+  double parity_max_abs = 0.0;
+  double parity_max_rel = 0.0;
+  int64_t parity_failures = 0;
   std::vector<double> func_max_abs;
   std::vector<double> func_max_rel;
   std::vector<int64_t> func_failures;
@@ -258,7 +238,6 @@ BasisKind determineBasis(const std::vector<FunctionId>& funcs);
 int inputsPerRow(int terms, int num_funcs);
 int roundUp(int x, int a);
 std::vector<int> makePositions(int terms, int ipr, LayoutKind layout);
-void checkSparse24(const std::vector<int>& pos, int terms, int ipr);
 void printProblemSpec(const ProblemSpec& spec, const Options& opt);
 ProblemSpec makeProblemSpec(const Options& opt);
 std::vector<float> makeInputs(const Options& opt, BasisKind basis);

@@ -53,41 +53,32 @@ CoefficientLayout buildCoefficientLayout(
   return layout;
 }
 
-bool isCoefficientSparse24(const std::vector<__half>& physical_b) {
-  if (physical_b.size() != size_t(WMMA_K * OUT_PAD)) return false;
-  for (int col = 0; col < OUT_PAD; ++col) {
-    for (int group = 0; group < WMMA_K / 4; ++group) {
-      int nonzeros = 0;
-      for (int offset = 0; offset < 4; ++offset) {
-        int k = group * 4 + offset;
-        nonzeros += __half2float(physical_b[k * OUT_PAD + col]) != 0.0f;
-      }
-      if (nonzeros > 2) return false;
-    }
-  }
-  return true;
-}
-
 void buildCoefficientCsrTranspose(const std::vector<__half>& b,
+                                  int output_rows,
+                                  int k_rows,
                                   std::vector<int>& row_ptr,
                                   std::vector<int>& col_ind,
                                   std::vector<__half>& values) {
   if (b.size() != size_t(WMMA_K * OUT_PAD)) {
     throw std::runtime_error("coefficient matrix must have shape 16x16");
   }
-  row_ptr.assign(OUT_PAD + 1, 0);
+  if (output_rows < 1 || output_rows > OUT_PAD ||
+      k_rows < 1 || k_rows > WMMA_K) {
+    throw std::runtime_error("invalid used coefficient submatrix dimensions");
+  }
+
+  row_ptr.assign(output_rows + 1, 0);
   col_ind.clear();
   values.clear();
-  for (int r = 0; r < OUT_PAD; ++r) {
-    for (int k = 0; k < WMMA_K; ++k) {
-      __half entry = b[k * OUT_PAD + r];
-      float v = __half2float(entry);
-      if (v != 0.0f) {
+  for (int row = 0; row < output_rows; ++row) {
+    for (int k = 0; k < k_rows; ++k) {
+      __half entry = b[k * OUT_PAD + row];
+      if (__half2float(entry) != 0.0f) {
         col_ind.push_back(k);
         values.push_back(entry);
       }
     }
-    row_ptr[r + 1] = int(col_ind.size());
+    row_ptr[row + 1] = int(col_ind.size());
   }
 }
 
