@@ -11,6 +11,7 @@ struct EngineContext {
   float* d_out = nullptr;
   const int* d_funcs = nullptr;
   const int* d_positions = nullptr;
+  const int* d_output_groups = nullptr;
 };
 
 class Engine {

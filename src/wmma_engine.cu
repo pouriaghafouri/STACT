@@ -9,7 +9,9 @@ class WmmaEngine final : public Engine {
   void run(cudaStream_t stream = nullptr) override {
     launchWmma(ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
                ctx_.spec.num_funcs, ctx_.opt->n, ctx_.opt->terms,
-               ctx_.spec.ipr, ctx_.spec.basis, ctx_.d_positions, stream);
+               ctx_.spec.ipr, ctx_.spec.basis, ctx_.d_positions,
+               ctx_.d_output_groups, ctx_.opt->reference_compat,
+               ctx_.opt->reference_repeat, stream);
   }
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
     SectionTimes st;

@@ -13,7 +13,8 @@ class CuSparseEngine final : public Engine {
     d_powerT_.allocate(size_t(WMMA_K) * rows_pad_ * sizeof(__half));
     d_ct_.allocate(size_t(OUT_PAD) * rows_pad_ * sizeof(float));
 
-    auto bt = buildCoefficientBT(opt.funcs, opt.terms, ctx_.spec.ipr, ctx_.spec.positions);
+    auto bt = buildCoefficientBT(opt.funcs, opt.terms, ctx_.spec.ipr,
+                                 ctx_.spec.positions, ctx_.spec.output_groups);
     std::vector<int> rowPtr, colInd;
     std::vector<__half> vals;
     buildCSRFromBT(bt, rowPtr, colInd, vals);
@@ -65,7 +66,8 @@ class CuSparseEngine final : public Engine {
                                      CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT,
                                      d_buffer_.ptr));
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
-                    ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr, stream);
+                    ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
+                    ctx_.d_output_groups, stream);
   }
 
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
@@ -93,7 +95,8 @@ class CuSparseEngine final : public Engine {
 
     phase.tic(stream);
     launchPostFloat(d_ct_.as<float>(), ctx_.d_in, ctx_.d_out, ctx_.d_funcs,
-                    ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr, stream);
+                    ctx_.spec.num_funcs, ctx_.opt->n, rows_pad_, ctx_.spec.ipr,
+                    ctx_.d_output_groups, stream);
     st.postprocess_ms += phase.toc(stream);
 
     st.total_ms = total.toc(stream);

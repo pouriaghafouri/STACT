@@ -48,8 +48,8 @@
   cusparseStatus_t _s = (call);                                         \
   if (_s != CUSPARSE_STATUS_SUCCESS) {                                  \
     std::ostringstream _oss;                                            \
-    _oss << "cuSPARSELt error " << cusparseLtGetErrorName(_s)          \
-         << " (" << cusparseLtGetErrorString(_s) << ", code "         \
+    _oss << "cuSPARSELt error " << cusparseGetErrorName(_s)            \
+         << " (" << cusparseGetErrorString(_s) << ", code "           \
          << int(_s) << ") at " << __FILE__ << ":" << __LINE__;        \
     throw std::runtime_error(_oss.str());                               \
   }                                                                     \
@@ -64,9 +64,11 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 constexpr int WARP_SIZE = 32;
-constexpr int WARPS_PER_BLOCK = 4;
+// The reference TACT kernels launch eight warps per block.  Keeping the same
+// shape preserves their 80-input-per-warp packing and occupancy experiment.
+constexpr int WARPS_PER_BLOCK = 8;
 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
-constexpr int MAX_FUNCS = 3;
+constexpr int MAX_FUNCS = 4;
 constexpr int OUT_PAD = 16;
 
 enum FunctionId : int {
@@ -117,6 +119,12 @@ struct Options {
   bool validate = true;
   bool print_layout = false;
   bool profile_sections = true;
+  bool reference_compat = false;
+  int reference_repeat = 2000;
+  bool debug = false;
+  int debug_values = 8;
+  int debug_rows = 2;
+  std::string debug_file;
 };
 
 struct ProblemSpec {
@@ -124,6 +132,10 @@ struct ProblemSpec {
   int num_funcs = 0;
   int ipr = 0;
   std::vector<int> positions;
+  // Requested-output index -> physical coefficient-column group.  The old
+  // triple kernel stores cos, sin, tan groups in that order even though the
+  // public CLI convention is commonly sin,cos,tan.
+  std::vector<int> output_groups;
 };
 
 struct SectionTimes {
@@ -137,6 +149,9 @@ struct SectionTimes {
 
 struct RunResult {
   float init_ms = 0.0f;
+  float avg_h2d_ms = 0.0f;
+  float avg_kernel_ms = 0.0f;
+  float avg_d2h_ms = 0.0f;
   float avg_ms = 0.0f;
   float min_ms = 0.0f;
   float max_ms = 0.0f;

@@ -10,7 +10,7 @@ __device__ inline float fastBaseline(FunctionId f, float x) {
     case F_LOG1P: return __logf(1.0f + x);
     case F_SIN: return __sinf(x);
     case F_COS: return __cosf(x);
-    case F_TAN: return __sinf(x) / __cosf(x);
+    case F_TAN: return __tanf(x);
     case F_SINH: return sinhf(x);
     case F_COSH: return coshf(x);
     case F_TANH: return tanhf(x);
@@ -32,18 +32,18 @@ __device__ inline float spBaseline(FunctionId f, float x) {
   return 0.0f;
 }
 
+template <bool UseFast>
 __global__ void baselineKernel(const float* __restrict__ in,
                                float* __restrict__ out,
                                const int* __restrict__ funcs,
                                int num_funcs,
-                               int n,
-                               int use_fast) {
+                               int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   float x = in[idx];
   for (int f = 0; f < num_funcs; ++f) {
     FunctionId fid = static_cast<FunctionId>(funcs[f]);
-    out[size_t(f) * n + idx] = use_fast ? fastBaseline(fid, x) : spBaseline(fid, x);
+    out[size_t(f) * n + idx] = UseFast ? fastBaseline(fid, x) : spBaseline(fid, x);
   }
 }
 
@@ -55,7 +55,10 @@ __global__ void tactWmmaKernel(const float* __restrict__ in,
                                int terms,
                                int ipr,
                                BasisKind basis,
-                               const int* __restrict__ positions) {
+                               const int* __restrict__ positions,
+                               const int* __restrict__ output_groups,
+                               int reference_compat,
+                               int reference_repeat) {
   __shared__ __half sharedB[WMMA_K * WMMA_N];
   __shared__ __half sharedA[WARPS_PER_BLOCK * WMMA_M * WMMA_K];
   __shared__ float sharedC[WARPS_PER_BLOCK * WMMA_M * WMMA_N];
@@ -71,7 +74,7 @@ __global__ void tactWmmaKernel(const float* __restrict__ in,
     int s = tmp % ipr;
     int f = tmp / ipr;
     int k = positions[s * terms + t];
-    int col = f * ipr + s;
+    int col = output_groups[f] * ipr + s;
     FunctionId fid = static_cast<FunctionId>(funcs[f]);
     sharedB[k * WMMA_N + col] = __float2half(coeffFor(fid, t));
   }
@@ -103,10 +106,16 @@ __global__ void tactWmmaKernel(const float* __restrict__ in,
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    wmma::fill_fragment(c_frag, 0.0f);
+    // The old kernels seed every accumulator element with one and then issue
+    // the same MMA 2000 times.  Normal mode performs one mathematical product
+    // and adds the leading one in post-processing.
+    wmma::fill_fragment(c_frag, reference_compat ? 1.0f : 0.0f);
     wmma::load_matrix_sync(a_frag, myA, WMMA_K);
     wmma::load_matrix_sync(b_frag, sharedB, WMMA_N);
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    int mma_repeats = reference_compat ? reference_repeat : 1;
+    for (int repeat = 0; repeat < mma_repeats; ++repeat) {
+      wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
     wmma::store_matrix_sync(myC, c_frag, WMMA_N, wmma::mem_row_major);
   }
   __syncthreads();
@@ -120,9 +129,11 @@ __global__ void tactWmmaKernel(const float* __restrict__ in,
     float x = in[idx];
     for (int f = 0; f < num_funcs; ++f) {
       FunctionId fid = static_cast<FunctionId>(funcs[f]);
-      int col = f * ipr + s;
+      int col = output_groups[f] * ipr + s;
       float residual = myC[row * WMMA_N + col];
-      out[size_t(f) * n + idx] = postprocess(fid, residual, x);
+      out[size_t(f) * n + idx] = reference_compat
+          ? (needsMultiplyByX(fid) ? residual * x : residual)
+          : postprocess(fid, residual, x);
     }
   }
 }
@@ -172,7 +183,8 @@ __global__ void postprocessTransposeFloatKernel(const float* __restrict__ cT,
                                                 int num_funcs,
                                                 int n,
                                                 int rows_pad,
-                                                int ipr) {
+                                                int ipr,
+                                                const int* __restrict__ output_groups) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   int row = idx / ipr;
@@ -180,7 +192,7 @@ __global__ void postprocessTransposeFloatKernel(const float* __restrict__ cT,
   float x = in[idx];
   for (int f = 0; f < num_funcs; ++f) {
     FunctionId fid = static_cast<FunctionId>(funcs[f]);
-    int out_col = f * ipr + slot;
+    int out_col = output_groups[f] * ipr + slot;
     float residual = cT[out_col * rows_pad + row];
     out[size_t(f) * n + idx] = postprocess(fid, residual, x);
   }
@@ -193,7 +205,8 @@ __global__ void postprocessTransposeHalfKernel(const __half* __restrict__ cT,
                                                int num_funcs,
                                                int n,
                                                int rows_pad,
-                                               int ipr) {
+                                               int ipr,
+                                               const int* __restrict__ output_groups) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   int row = idx / ipr;
@@ -201,7 +214,7 @@ __global__ void postprocessTransposeHalfKernel(const __half* __restrict__ cT,
   float x = in[idx];
   for (int f = 0; f < num_funcs; ++f) {
     FunctionId fid = static_cast<FunctionId>(funcs[f]);
-    int out_col = f * ipr + slot;
+    int out_col = output_groups[f] * ipr + slot;
     float residual = __half2float(cT[out_col * rows_pad + row]);
     out[size_t(f) * n + idx] = postprocess(fid, residual, x);
   }
@@ -211,17 +224,27 @@ void launchBaseline(const float* d_in, float* d_out, const int* d_funcs,
                     int num_funcs, int n, bool fast, cudaStream_t stream) {
   int block = 256;
   int grid = (n + block - 1) / block;
-  baselineKernel<<<grid, block, 0, stream>>>(d_in, d_out, d_funcs, num_funcs, n, fast ? 1 : 0);
+  if (fast) {
+    baselineKernel<true><<<grid, block, 0, stream>>>(
+        d_in, d_out, d_funcs, num_funcs, n);
+  } else {
+    baselineKernel<false><<<grid, block, 0, stream>>>(
+        d_in, d_out, d_funcs, num_funcs, n);
+  }
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
 void launchWmma(const float* d_in, float* d_out, const int* d_funcs,
                 int num_funcs, int n, int terms, int ipr, BasisKind basis,
-                const int* d_positions, cudaStream_t stream) {
+                const int* d_positions, const int* d_output_groups,
+                bool reference_compat, int reference_repeat,
+                cudaStream_t stream) {
   int rows = (n + ipr - 1) / ipr;
   int warp_tiles = (rows + WMMA_M - 1) / WMMA_M;
   int grid = (warp_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-  tactWmmaKernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(d_in, d_out, d_funcs, num_funcs, n, terms, ipr, basis, d_positions);
+  tactWmmaKernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
+      d_in, d_out, d_funcs, num_funcs, n, terms, ipr, basis, d_positions,
+      d_output_groups, reference_compat ? 1 : 0, reference_repeat);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -247,19 +270,21 @@ void launchBuildPowerRows(const float* d_in, __half* d_pRows, int n, int rows_pa
 
 void launchPostFloat(const float* d_ct, const float* d_in, float* d_out,
                      const int* d_funcs, int num_funcs, int n, int rows_pad,
-                     int ipr, cudaStream_t stream) {
+                     int ipr, const int* d_output_groups, cudaStream_t stream) {
   int block = 256;
   int grid = (n + block - 1) / block;
-  postprocessTransposeFloatKernel<<<grid, block, 0, stream>>>(d_ct, d_in, d_out, d_funcs, num_funcs, n, rows_pad, ipr);
+  postprocessTransposeFloatKernel<<<grid, block, 0, stream>>>(
+      d_ct, d_in, d_out, d_funcs, num_funcs, n, rows_pad, ipr, d_output_groups);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
 void launchPostHalf(const __half* d_ct, const float* d_in, float* d_out,
                     const int* d_funcs, int num_funcs, int n, int rows_pad,
-                    int ipr, cudaStream_t stream) {
+                    int ipr, const int* d_output_groups, cudaStream_t stream) {
   int block = 256;
   int grid = (n + block - 1) / block;
-  postprocessTransposeHalfKernel<<<grid, block, 0, stream>>>(d_ct, d_in, d_out, d_funcs, num_funcs, n, rows_pad, ipr);
+  postprocessTransposeHalfKernel<<<grid, block, 0, stream>>>(
+      d_ct, d_in, d_out, d_funcs, num_funcs, n, rows_pad, ipr, d_output_groups);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -298,7 +323,8 @@ __global__ void postprocessHalfChunkKernel(const __half* __restrict__ cT,
                                            int n,
                                            int row_start,
                                            int chunk_rows_pad,
-                                           int ipr) {
+                                           int ipr,
+                                           const int* __restrict__ output_groups) {
   int local_idx = blockIdx.x * blockDim.x + threadIdx.x;
   int max_values = chunk_rows_pad * ipr;
   if (local_idx >= max_values) return;
@@ -309,7 +335,7 @@ __global__ void postprocessHalfChunkKernel(const __half* __restrict__ cT,
   float x = in[global_idx];
   for (int f = 0; f < num_funcs; ++f) {
     FunctionId fid = static_cast<FunctionId>(funcs[f]);
-    int out_col = f * ipr + slot;
+    int out_col = output_groups[f] * ipr + slot;
     float residual = __half2float(cT[out_col * chunk_rows_pad + local_row]);
     out[size_t(f) * n + global_idx] = postprocess(fid, residual, x);
   }
@@ -329,10 +355,13 @@ void launchBuildPowerRowsChunk(const float* d_in, __half* d_pRows, int n,
 void launchPostHalfChunk(const __half* d_ct, const float* d_in, float* d_out,
                          const int* d_funcs, int num_funcs, int n,
                          int row_start, int chunk_rows_pad, int ipr,
+                         const int* d_output_groups,
                          cudaStream_t stream) {
   int block = 256;
   int grid = (chunk_rows_pad * ipr + block - 1) / block;
-  postprocessHalfChunkKernel<<<grid, block, 0, stream>>>(d_ct, d_in, d_out, d_funcs, num_funcs, n, row_start, chunk_rows_pad, ipr);
+  postprocessHalfChunkKernel<<<grid, block, 0, stream>>>(
+      d_ct, d_in, d_out, d_funcs, num_funcs, n, row_start,
+      chunk_rows_pad, ipr, d_output_groups);
   TACT_CUDA_CHECK(cudaGetLastError());
 }
 

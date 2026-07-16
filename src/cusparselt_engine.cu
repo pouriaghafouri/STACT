@@ -40,7 +40,8 @@ class CuSparseLtEngine final : public Engine {
     // with opA=T and opB=T. The physical sparse A is K x N, so opA(A) is the
     // logical coefficient matrix B^T: N x K. This avoids the NOT_SUPPORTED /
     // operation-not-permitted descriptor combination hit by row-major NN.
-    auto b = buildCoefficientB(opt.funcs, opt.terms, ctx_.spec.ipr, ctx_.spec.positions);
+    auto b = buildCoefficientB(opt.funcs, opt.terms, ctx_.spec.ipr,
+                               ctx_.spec.positions, ctx_.spec.output_groups);
     d_sparseA_.allocate(size_t(WMMA_K) * OUT_PAD * sizeof(__half));
     TACT_CUDA_CHECK(cudaMemcpy(d_sparseA_.as<__half>(), b.data(), b.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -65,16 +66,28 @@ class CuSparseLtEngine final : public Engine {
                                                          CUSPARSE_OPERATION_TRANSPOSE,
                                                          CUSPARSE_OPERATION_TRANSPOSE,
                                                          &matA_, &matB_, &matC_, &matC_,
+#if CUSPARSELT_VERSION < 500
+                                                         CUSPARSE_COMPUTE_16F));
+#else
                                                          CUSPARSE_COMPUTE_32F));
+#endif
     TACT_CUSPARSELT_CHECK(cusparseLtMatmulAlgSelectionInit(&handle_, &alg_sel_, &matmul_,
                                                            CUSPARSELT_MATMUL_ALG_DEFAULT));
+#if CUSPARSELT_VERSION < 500
+    // cuSPARSELt 0.3 exposes a workspace-size limit in PlanInit. Zero asks for
+    // the default plan; MatmulGetWorkspace below reports its actual allocation.
+    TACT_CUSPARSELT_CHECK(cusparseLtMatmulPlanInit(&handle_, &plan_, &matmul_, &alg_sel_, 0));
+#else
     TACT_CUSPARSELT_CHECK(cusparseLtMatmulPlanInit(&handle_, &plan_, &matmul_, &alg_sel_));
+#endif
 
+#if CUSPARSELT_VERSION >= 500
     void* sparse_ptr_for_desc = d_sparseA_.ptr;
     TACT_CUSPARSELT_CHECK(cusparseLtMatmulDescSetAttribute(&handle_, &matmul_,
                                                            CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
                                                            &sparse_ptr_for_desc,
                                                            sizeof(sparse_ptr_for_desc)));
+#endif
 
     DeviceBuffer d_valid(sizeof(int));
     TACT_CUDA_CHECK(cudaMemset(d_valid.ptr, 0, sizeof(int)));
@@ -89,6 +102,15 @@ class CuSparseLtEngine final : public Engine {
     }
 
     size_t compressed_size = 0;
+#if CUSPARSELT_VERSION < 500
+    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompressedSize(&handle_, &plan_,
+                                                        &compressed_size));
+    d_compressed_.allocate(compressed_size);
+    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompress(&handle_, &plan_,
+                                                  d_sparseA_.as<__half>(),
+                                                  d_compressed_.ptr,
+                                                  nullptr));
+#else
     size_t compressed_buffer_size = 0;
     TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompressedSize(&handle_, &plan_,
                                                         &compressed_size,
@@ -100,6 +122,7 @@ class CuSparseLtEngine final : public Engine {
                                                   d_compressed_.ptr,
                                                   d_compressed_buffer_.ptr,
                                                   nullptr));
+#endif
     TACT_CUDA_CHECK(cudaDeviceSynchronize());
 
     size_t workspace_size = 0;
@@ -108,9 +131,10 @@ class CuSparseLtEngine final : public Engine {
   }
 
   ~CuSparseLtEngine() override {
-    if (plan_initialized_) {}
     cusparseLtMatmulPlanDestroy(&plan_);
+#if CUSPARSELT_VERSION >= 500
     cusparseLtMatmulAlgSelectionDestroy(&alg_sel_);
+#endif
     cusparseLtMatDescriptorDestroy(&matA_);
     cusparseLtMatDescriptorDestroy(&matB_);
     cusparseLtMatDescriptorDestroy(&matC_);
@@ -120,6 +144,7 @@ class CuSparseLtEngine final : public Engine {
   void run(cudaStream_t stream = nullptr) override {
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    cudaStream_t streams[1] = {stream};
     int processed = 0;
     while (processed < rows_total_) {
       launchBuildPowerRowsChunk(ctx_.d_in, d_powerRows_.as<__half>(), ctx_.opt->n,
@@ -133,11 +158,11 @@ class CuSparseLtEngine final : public Engine {
                                              d_cth_.as<__half>(),
                                              d_cth_.as<__half>(),
                                              d_workspace_.ptr,
-                                             stream ? &stream : nullptr,
-                                             stream ? 1 : 0));
+                                             streams, 1));
       launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
                           ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
-                          processed, chunk_rows_pad_, ctx_.spec.ipr, stream);
+                          processed, chunk_rows_pad_, ctx_.spec.ipr,
+                          ctx_.d_output_groups, stream);
       processed += chunk_rows_pad_;
     }
   }
@@ -146,6 +171,7 @@ class CuSparseLtEngine final : public Engine {
     SectionTimes st;
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    cudaStream_t streams[1] = {stream};
     GpuTimer total, phase;
     total.tic(stream);
     int processed = 0;
@@ -165,14 +191,14 @@ class CuSparseLtEngine final : public Engine {
                                              d_cth_.as<__half>(),
                                              d_cth_.as<__half>(),
                                              d_workspace_.ptr,
-                                             stream ? &stream : nullptr,
-                                             stream ? 1 : 0));
+                                             streams, 1));
       st.matmul_ms += phase.toc(stream);
 
       phase.tic(stream);
       launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
                           ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
-                          processed, chunk_rows_pad_, ctx_.spec.ipr, stream);
+                          processed, chunk_rows_pad_, ctx_.spec.ipr,
+                          ctx_.d_output_groups, stream);
       st.postprocess_ms += phase.toc(stream);
       processed += chunk_rows_pad_;
     }
@@ -190,7 +216,6 @@ class CuSparseLtEngine final : public Engine {
   cusparseLtMatmulDescriptor_t matmul_{};
   cusparseLtMatmulAlgSelection_t alg_sel_{};
   cusparseLtMatmulPlan_t plan_{};
-  bool plan_initialized_ = true;
 };
 }  // namespace
 

@@ -172,6 +172,33 @@ ProblemSpec makeProblemSpec(const Options& opt) {
   spec.num_funcs = int(opt.funcs.size());
   spec.ipr = inputsPerRow(opt.terms, spec.num_funcs);
   spec.positions = makePositions(opt.terms, spec.ipr, opt.layout);
+  spec.output_groups.resize(spec.num_funcs);
+
+  // Reproduce the physical function-column order in TripleTranscendCore:
+  // cosine columns [0,ipr), sine columns [ipr,2*ipr), then tangent.  Other
+  // combinations use the same stable canonical order, which makes dual and
+  // quad layouts direct subsets/extensions of the reference triple layout.
+  auto rank = [](FunctionId f) {
+    switch (f) {
+      case F_COS: return 0;
+      case F_SIN: return 1;
+      case F_TAN: return 2;
+      case F_SINH: return 3;
+      case F_COSH: return 4;
+      case F_TANH: return 5;
+      case F_EXP: return 0;
+      case F_LOG1P: return 1;
+    }
+    return 99;
+  };
+  std::vector<int> order(spec.num_funcs);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    return rank(opt.funcs[a]) < rank(opt.funcs[b]);
+  });
+  for (int group = 0; group < spec.num_funcs; ++group) {
+    spec.output_groups[order[group]] = group;
+  }
   if (opt.layout == LAYOUT_SPARSE24) checkSparse24(spec.positions, opt.terms, spec.ipr);
   return spec;
 }
@@ -184,6 +211,11 @@ void printProblemSpec(const ProblemSpec& spec, const Options& opt) {
     for (int t = 0; t < opt.terms; ++t) std::cerr << " k" << spec.positions[s * opt.terms + t];
     std::cerr << "\n";
   }
+  std::cerr << "Coefficient column groups:";
+  for (int f = 0; f < spec.num_funcs; ++f) {
+    std::cerr << " " << functionName(opt.funcs[f]) << "->" << spec.output_groups[f];
+  }
+  std::cerr << "\n";
 }
 
 static bool containsFunction(const std::vector<FunctionId>& fs, FunctionId target) {
@@ -191,6 +223,20 @@ static bool containsFunction(const std::vector<FunctionId>& fs, FunctionId targe
 }
 
 std::vector<float> makeInputs(const Options& opt, BasisKind basis) {
+  if (opt.reference_compat) {
+    std::vector<float> h(opt.n);
+    if (opt.engine == ENGINE_WMMA) {
+      // cosine_tensor_core initializes D to 5; TripleTranscendCore uses 1.
+      std::fill(h.begin(), h.end(), opt.funcs.size() == 1 ? 5.0f : 1.0f);
+    } else {
+      // Both historical scalar programs use pi * (2*i + 1).
+      constexpr double pi = 3.14159265358979323846264338327950288;
+      for (int i = 0; i < opt.n; ++i) {
+        h[i] = static_cast<float>(pi * (2.0 * static_cast<double>(i) + 1.0));
+      }
+    }
+    return h;
+  }
   float xmin = opt.xmin, xmax = opt.xmax;
   if (!opt.min_set || !opt.max_set) {
     // These defaults are intentionally validation-safe for the truncated Taylor
@@ -256,6 +302,9 @@ RunResult computeValidation(const std::vector<float>& out,
 
 Options parseArgs(int argc, char** argv) {
   Options opt;
+  bool terms_set = false;
+  bool mode_set = false;
+  bool validate_set = false;
   auto need = [&](int& i) -> std::string {
     if (i + 1 >= argc) throw std::runtime_error(std::string("Missing value for ") + argv[i]);
     return argv[++i];
@@ -267,38 +316,85 @@ Options parseArgs(int argc, char** argv) {
     else if (a == "--functions" || a == "--funcs") {
       opt.funcs.clear();
       for (const auto& s : split(need(i), ',')) opt.funcs.push_back(parseFunction(s));
-    } else if (a == "--terms") opt.terms = std::stoi(need(i));
+    } else if (a == "--terms") { opt.terms = std::stoi(need(i)); terms_set = true; }
     else if (a == "--n") opt.n = std::stoi(need(i));
     else if (a == "--warmup") opt.warmup = std::stoi(need(i));
     else if (a == "--iterations" || a == "--iters") opt.iterations = std::stoi(need(i));
     else if (a == "--inner-repeat" || a == "--repeat") opt.inner_repeat = std::stoi(need(i));
+    else if (a == "--reference-compatible" || a == "--legacy-reference" || a == "--tact-reference") {
+      opt.reference_compat = true;
+      mode_set = true;
+    }
+    else if (a == "--clean" || a == "--clean-math") {
+      opt.reference_compat = false;
+      mode_set = true;
+    }
+    else if (a == "--reference-repeat" || a == "--legacy-repeat") opt.reference_repeat = std::stoi(need(i));
     else if (a == "--threshold") opt.threshold = std::stof(need(i));
     else if (a == "--seed") opt.seed = std::stoull(need(i));
     else if (a == "--min") { opt.xmin = std::stof(need(i)); opt.min_set = true; }
     else if (a == "--max") { opt.xmax = std::stof(need(i)); opt.max_set = true; }
     else if (a == "--csv") opt.csv_path = need(i);
-    else if (a == "--no-validate") opt.validate = false;
+    else if (a == "--validate") { opt.validate = true; validate_set = true; }
+    else if (a == "--no-validate") { opt.validate = false; validate_set = true; }
     else if (a == "--profile-sections") opt.profile_sections = true;
     else if (a == "--no-profile-sections") opt.profile_sections = false;
     else if (a == "--print-layout") opt.print_layout = true;
+    else if (a == "--debug") opt.debug = true;
+    else if (a == "--debug-values") { opt.debug = true; opt.debug_values = std::stoi(need(i)); }
+    else if (a == "--debug-rows") { opt.debug = true; opt.debug_rows = std::stoi(need(i)); }
+    else if (a == "--debug-file") { opt.debug = true; opt.debug_file = need(i); }
     else if (a == "--help" || a == "-h") {
       std::cout <<
         "TACT benchmark\n"
         "  --engine baseline_fast|baseline_sp|wmma|cusparse|cusparselt\n"
-        "  --functions sin,cos,tan | exp,ln1p | compatible single/dual/triple sets\n"
+        "  --functions sin,cos,tan | exp,ln1p | compatible 1..4-function sets\n"
         "  --terms <1..8> --layout dense|sparse24\n"
         "  --n <count> --warmup <k> --iterations <k> --inner-repeat <k>\n"
         "  --threshold <eps> --min <x> --max <x> --csv results.csv --print-layout\n"
-        "  --profile-sections | --no-profile-sections\n";
+        "  --profile-sections | --no-profile-sections\n"
+        "  --debug [--debug-values <k>] [--debug-rows <k>] [--debug-file <path>]\n"
+        "  --tact-reference | --clean  (old stress workload or one-pass math)\n"
+        "  --legacy-repeat <k> --validate | --no-validate\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown option: " + a);
     }
   }
-  if (opt.funcs.empty() || opt.funcs.size() > MAX_FUNCS) throw std::runtime_error("Use 1, 2, or 3 functions.");
+  if (opt.funcs.empty() || opt.funcs.size() > MAX_FUNCS) throw std::runtime_error("Use between 1 and 4 functions.");
+
+  bool single_cos = opt.funcs.size() == 1 && opt.funcs[0] == F_COS;
+  bool triple = opt.funcs.size() == 3 && opt.funcs[0] == F_SIN &&
+                opt.funcs[1] == F_COS && opt.funcs[2] == F_TAN;
+  bool historical_engine = opt.engine == ENGINE_BASELINE_FAST ||
+                           opt.engine == ENGINE_BASELINE_SP ||
+                           opt.engine == ENGINE_WMMA;
+  // Match the historical programs without requiring extra flags. Supplying a
+  // different term count is treated as an intentional clean/generalized run.
+  if (!mode_set && historical_engine && (single_cos || triple) &&
+      (!terms_set || opt.terms == 3)) {
+    opt.reference_compat = true;
+    if (!terms_set) opt.terms = 3;
+    if (!validate_set) opt.validate = false;
+  }
+  if (opt.reference_compat && !terms_set) opt.terms = 3;
   if ((opt.min_set && !opt.max_set) || (!opt.min_set && opt.max_set)) throw std::runtime_error("Set both --min and --max or neither.");
   if (opt.min_set && !(opt.xmin < opt.xmax)) throw std::runtime_error("--min must be less than --max.");
-  if (opt.n <= 0 || opt.warmup < 0 || opt.iterations <= 0 || opt.inner_repeat <= 0) throw std::runtime_error("Invalid n/warmup/iterations/inner-repeat.");
+  if (opt.n <= 0 || opt.warmup < 0 || opt.iterations <= 0 || opt.inner_repeat <= 0 ||
+      opt.reference_repeat <= 0 || opt.debug_values <= 0 || opt.debug_rows <= 0) {
+    throw std::runtime_error("Invalid n/warmup/iterations/repeat/debug count.");
+  }
+  if (opt.reference_compat) {
+    if (!single_cos && !triple) {
+      throw std::runtime_error("--legacy-reference supports the old reference cases: cos or sin,cos,tan.");
+    }
+    if (opt.engine == ENGINE_WMMA && (opt.terms != 3 || opt.layout != LAYOUT_DENSE)) {
+      throw std::runtime_error("Legacy WMMA reference mode requires --terms 3 --layout dense.");
+    }
+    if (opt.engine == ENGINE_CUSPARSE || opt.engine == ENGINE_CUSPARSELT) {
+      throw std::runtime_error("Legacy reference stress mode exists only in the old SFU/SP and WMMA kernels.");
+    }
+  }
   return opt;
 }
 
@@ -307,14 +403,17 @@ void appendCsv(const std::string& path, const Options& opt, const RunResult& r) 
   { std::ifstream f(path); exists = f.good(); }
   std::ofstream out(path, std::ios::app);
   if (!exists) {
-    out << "engine,layout,functions,terms,n,warmup,iterations,inner_repeat,timed_values_per_iteration,timed_outputs_per_iteration,init_ms,avg_ms,min_ms,max_ms,avg_baseline_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,avg_postprocess_ms,throughput_mvalues_s,max_abs,max_rel,failures,threshold\n";
+    out << "engine,layout,functions,terms,n,warmup,iterations,inner_repeat,reference_compatible,reference_repeat,timed_values_per_iteration,timed_outputs_per_iteration,init_ms,avg_h2d_ms,avg_kernel_ms,avg_d2h_ms,avg_ms,min_ms,max_ms,avg_baseline_ms,avg_fused_kernel_ms,avg_build_power_ms,avg_matmul_ms,avg_postprocess_ms,throughput_mvalues_s,max_abs,max_rel,failures,threshold\n";
   }
   out << engineName(opt.engine) << ','
       << layoutName(opt.layout) << ','
       << functionListName(opt.funcs) << ','
       << opt.terms << ',' << opt.n << ',' << opt.warmup << ',' << opt.iterations << ',' << opt.inner_repeat << ','
+      << (opt.reference_compat ? 1 : 0) << ',' << opt.reference_repeat << ','
       << std::setprecision(12) << r.timed_values << ',' << r.timed_outputs << ','
-      << std::setprecision(8) << r.init_ms << ',' << r.avg_ms << ',' << r.min_ms << ',' << r.max_ms << ','
+      << std::setprecision(8) << r.init_ms << ',' << r.avg_h2d_ms << ','
+      << r.avg_kernel_ms << ',' << r.avg_d2h_ms << ',' << r.avg_ms << ','
+      << r.min_ms << ',' << r.max_ms << ','
       << r.avg_baseline_ms << ',' << r.avg_fused_kernel_ms << ',' << r.avg_build_power_ms << ',' << r.avg_matmul_ms << ',' << r.avg_postprocess_ms << ','
       << r.throughput_mvals_s << ',' << r.max_abs << ',' << r.max_rel << ',' << r.failures << ',' << opt.threshold << "\n";
 }

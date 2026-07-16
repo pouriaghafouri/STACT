@@ -1,0 +1,1 @@
+  -L/path/to/cusparselt/lib  -L/path/to/cusparselt/lib64  -Wl,-rpath,/path/to/cusparselt/lib:/path/to/cusparselt/lib64: "/usr/lib/x86_64-linux-gnu/libcudart.so" "/usr/lib/x86_64-linux-gnu/libcusparse.so" -lcusparseLt "/usr/lib/x86_64-linux-gnu/libnvJitLink.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

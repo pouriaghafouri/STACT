@@ -12,11 +12,20 @@ int main(int argc, char** argv) {
     std::cout << "  terms:       " << opt.terms << "\n";
     std::cout << "  N:           " << opt.n << " input x values per engine run\n";
     std::cout << "  inner repeat:" << opt.inner_repeat << " engine run(s) per timed iteration\n";
+    if (opt.reference_compat) {
+      std::cout << "  mode:        historical TACT workload, " << opt.reference_repeat
+                << " internal step(s) per engine run\n";
+    } else {
+      std::cout << "  mode:        clean one-pass computation\n";
+    }
     std::cout << "  outputs/it:  " << r.timed_outputs << " function values per timed iteration\n";
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "  init ms:     " << r.init_ms << " (engine setup/descriptors/static coefficients)\n";
-    std::cout << "  avg ms:      " << r.avg_ms << "\n";
-    std::cout << "  min/max ms:  " << r.min_ms << " / " << r.max_ms << "\n";
+    std::cout << "  HtoD avg ms: " << r.avg_h2d_ms << "\n";
+    std::cout << "  kernel avg ms: " << r.avg_kernel_ms << "\n";
+    std::cout << "  DtoH avg ms: " << r.avg_d2h_ms << "\n";
+    std::cout << "  total avg ms:  " << r.avg_ms << " (HtoD + kernel + DtoH)\n";
+    std::cout << "  total min/max ms: " << r.min_ms << " / " << r.max_ms << "\n";
     if (opt.profile_sections) {
       std::cout << "  section avg ms per timed iteration:\n";
       if (r.avg_baseline_ms > 0.0f) std::cout << "    baseline kernel: " << r.avg_baseline_ms << "\n";

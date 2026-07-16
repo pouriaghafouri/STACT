@@ -1,0 +1,7 @@
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/tact_bench.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/edit_cache.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/rebuild_cache.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/list_install_components.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/install.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/install/local.dir
+/home/farzam/Farzam/Sharif/Term8/TACT/STACT/STACT/build/CMakeFiles/install/strip.dir

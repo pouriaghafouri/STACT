@@ -7,13 +7,15 @@ namespace tact {
 std::vector<__half> buildCoefficientB(const std::vector<FunctionId>& funcs,
                                       int terms,
                                       int ipr,
-                                      const std::vector<int>& positions);
+                                      const std::vector<int>& positions,
+                                      const std::vector<int>& output_groups);
 
 // Dense row-major logical B^T: N x K. Used by cuSPARSE CSR SpMM.
 std::vector<__half> buildCoefficientBT(const std::vector<FunctionId>& funcs,
                                        int terms,
                                        int ipr,
-                                       const std::vector<int>& positions);
+                                       const std::vector<int>& positions,
+                                       const std::vector<int>& output_groups);
 
 void buildCSRFromBT(const std::vector<__half>& bt,
                     std::vector<int>& rowPtr,
