@@ -136,13 +136,15 @@ class CuSparseEngine final : public Engine {
     // complete multi-megabyte C matrix through global memory R times, unlike
     // WMMA which retains C in an accumulator fragment. cuSPARSE can express
     // the exact final algebra in one SpMM by setting alpha=R and beta=1.
-    const float alpha = float(ctx_.opt->stress_repeat);
+    const float alpha = 1.0f;
     const float beta = 1.0f;
-    TACT_CUSPARSE_CHECK(cusparseSpMM(
-        handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha, mat_coeff_t_, mat_power_t_, &beta, mat_result_t_,
-        CUDA_R_32F, kSpmmAlgorithm, d_buffer_.ptr));
+    for (int repeat = 0; repeat < ctx_.opt->stress_repeat; ++repeat) {
+      TACT_CUSPARSE_CHECK(cusparseSpMM(
+          handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_NON_TRANSPOSE,
+          &alpha, mat_coeff_t_, mat_power_t_, &beta, mat_result_t_,
+          CUDA_R_32F, kSpmmAlgorithm, d_buffer_.ptr));
+    }
   }
 
   void postprocess(cudaStream_t stream) {
