@@ -45,7 +45,7 @@ target_link_libraries(tact_bench PRIVATE CUDA::cudart CUDA::cusparse)
 
 target_compile_options(tact_bench PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo>
-  $<$<COMPILE_LANGUAGE:CXX>:-O3>
+  $<$<COMPILE_LANGUAGE:CXX>:-O0>
 )
 
 
@@ -70,13 +70,13 @@ set(TACT_LEGACY_CUDA_SOURCES
 if (TACT_CUDA_O0)
   set(TACT_LEGACY_CUDA_OPT -O0)
 else()
-  set(TACT_LEGACY_CUDA_OPT -O3)
+  set(TACT_LEGACY_CUDA_OPT -O0)
 endif()
 
 set_property(SOURCE ${TACT_LEGACY_CUDA_SOURCES}
   APPEND PROPERTY COMPILE_OPTIONS ${TACT_LEGACY_CUDA_OPT})
 set_property(SOURCE src/sparse_tc_engine.cu
-  APPEND PROPERTY COMPILE_OPTIONS -O3)
+  APPEND PROPERTY COMPILE_OPTIONS -O0)
 
 # SFU and SP are separate translation units so fast math never leaks into SP.
 set_property(SOURCE src/sfu_kernels.cu

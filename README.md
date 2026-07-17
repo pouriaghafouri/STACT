@@ -427,6 +427,6 @@ include/tact/engines.cuh    engine factory declaration
 src/common.cu               CLI parsing and layout rules
 src/runner.cu               engine selection and WMMA parity validation
 src/main.cu                 result reporting
-CMakeLists.txt              source registration and per-file -O3
+CMakeLists.txt              source registration and per-file -O0
 README.md                   commands and design notes
 ```
