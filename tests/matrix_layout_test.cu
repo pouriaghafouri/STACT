@@ -60,6 +60,34 @@ void checkCase(const std::vector<tact::FunctionId>& functions, int terms,
     logical_a[logical_k] = value;
     physical_a[layout.logical_to_physical[logical_k]] = value;
   }
+  // The custom sparse Tensor Core engine permutes the used K dimension from
+  // slot-major to term-major.  Verify for every supported case that each
+  // coefficient row then contains at most two nonzeros in every four-wide K
+  // group, which is the Ampere 2:4 requirement.
+  std::vector<__half> sparse_bt(tact::WMMA_N * tact::WMMA_K,
+                                __float2half(0.0f));
+  for (int slot = 0; slot < spec.ipr; ++slot) {
+    for (int term = 0; term < terms; ++term) {
+      const int logical_k = slot * terms + term;
+      const int sparse_k = term * spec.ipr + slot;
+      for (int row = 0; row < tact::WMMA_N; ++row) {
+        sparse_bt[row * tact::WMMA_K + sparse_k] =
+            layout.logical[logical_k * tact::WMMA_N + row];
+      }
+    }
+  }
+  for (int row = 0; row < tact::WMMA_N; ++row) {
+    for (int group = 0; group < tact::WMMA_K / 4; ++group) {
+      int nonzeros = 0;
+      for (int local = 0; local < 4; ++local) {
+        nonzeros += __half2float(
+            sparse_bt[row * tact::WMMA_K + group * 4 + local]) != 0.0f;
+      }
+      require(nonzeros <= 2,
+              "term-major coefficient permutation violates 2:4 sparsity");
+    }
+  }
+
   for (int col = 0; col < tact::OUT_PAD; ++col) {
     float logical_dot = 0.0f;
     float physical_dot = 0.0f;
@@ -158,6 +186,13 @@ int main() {
   require(sparse_options.engine == ENGINE_CUSPARSE &&
               sparse_options.layout == LAYOUT_CSR,
           "cuSPARSE CSR layout selection is incorrect");
+
+  Options sparse_tc_options = parseOptions({
+      "tact_bench", "--engine", "sparse_tc", "--functions",
+      "sin,cos,tan", "--terms", "3", "--layout", "dense"});
+  require(sparse_tc_options.engine == ENGINE_SPARSE_TC &&
+              sparse_tc_options.layout == LAYOUT_DENSE,
+          "custom sparse Tensor Core layout selection is incorrect");
 
   bool validation_flag_rejected = false;
   try {

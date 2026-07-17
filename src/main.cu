@@ -13,9 +13,11 @@ int main(int argc, char** argv) {
     std::cout << "  N:             " << opt.n << " input values\n";
     std::cout << "  stress repeat: " << opt.stress_repeat;
     if (opt.engine == tact::ENGINE_CUSPARSE) {
-      std::cout << " effective algebraic repetitions\n";
+      std::cout << " physical wide SpMM repetitions over 16x16 tile groups";
+    } else if (opt.engine == tact::ENGINE_SPARSE_TC) {
+      std::cout << " logical tile updates; 2 physical mma.sp.sync instructions per update";
     } else {
-      std::cout << " core-operation repetitions";
+      std::cout << " physical core-operation repetitions";
     }
     std::cout << "\n";
 
@@ -33,10 +35,18 @@ int main(int argc, char** argv) {
     } else if (opt.engine == tact::ENGINE_WMMA) {
       std::cout << "  kernel path:   generalized old-TACT WMMA tile\n";
     } else if (opt.engine == tact::ENGINE_CUSPARSE) {
-      std::cout << "  kernel path:   cuSPARSE CSR(B^T) * A^T, "
-                   "algebraically collapsed stress\n";
+      std::cout << "  kernel path:   wide cuSPARSE CSR(B^T) * [A_0^T|A_1^T|...], "
+                   "16-column WMMA-equivalent tile groups\n";
+    } else if (opt.engine == tact::ENGINE_SPARSE_TC) {
+      std::cout << "  kernel path:   custom Ampere 2:4 sparse Tensor Core PTX; "
+                   "register-resident stress mainloop\n";
     }
 
+    if (opt.engine == tact::ENGINE_SPARSE_TC) {
+      std::cout << "  sparse MMA/tile: "
+                << (2LL * opt.stress_repeat)
+                << " physical mma.sp.sync instructions\n";
+    }
     std::cout << "  outputs/it:    " << r.timed_outputs << " function values\n";
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "  init ms:       " << r.init_ms << "\n";
@@ -51,7 +61,7 @@ int main(int argc, char** argv) {
       if (r.avg_scalar_ms > 0.0f)
         std::cout << "    scalar kernel: " << r.avg_scalar_ms << "\n";
       if (r.avg_fused_kernel_ms > 0.0f)
-        std::cout << "    fused WMMA:    " << r.avg_fused_kernel_ms << "\n";
+        std::cout << "    fused matrix:  " << r.avg_fused_kernel_ms << "\n";
       if (r.avg_build_power_ms > 0.0f)
         std::cout << "    build/init C:  " << r.avg_build_power_ms << "\n";
       if (r.avg_matmul_ms > 0.0f)
@@ -80,8 +90,12 @@ int main(int argc, char** argv) {
                 << ", max_rel=" << r.func_max_rel[i]
                 << ", failures=" << r.func_failures[i] << "\n";
     }
-    if (opt.engine == tact::ENGINE_CUSPARSE) {
-      std::cout << "  cuSPARSE/WMMA parity:\n";
+    if (opt.engine == tact::ENGINE_CUSPARSE ||
+        opt.engine == tact::ENGINE_SPARSE_TC) {
+      std::cout << "  "
+                << (opt.engine == tact::ENGINE_CUSPARSE
+                        ? "cuSPARSE/WMMA parity:\n"
+                        : "sparse-TC/WMMA parity:\n");
       std::cout << "    max abs err: " << r.parity_max_abs << "\n";
       std::cout << "    max rel err: " << r.parity_max_rel << "\n";
       std::cout << "    failures:    " << r.parity_failures

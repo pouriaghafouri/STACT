@@ -2,268 +2,661 @@
 #include "tact/kernels.cuh"
 #include "tact/matrix_builders.cuh"
 
+#include <limits>
+#include <sstream>
+#include <vector>
+
 namespace tact {
-
-#ifndef TACT_ENABLE_CUSPARSELT
-std::unique_ptr<Engine> makeCuSparseLtEngine(const EngineContext&) {
-  throw UnsupportedError("This binary was built without cuSPARSELt. "
-                         "Reconfigure with -DTACT_ENABLE_CUSPARSELT=ON and "
-                         "set CUSPARSELT_ROOT if needed.");
-}
-#else
 namespace {
-class CuSparseLtEngine final : public Engine {
+
+// The WMMA backend evaluates independent 16x16 tiles.  For cuSPARSE we keep
+// exactly the same logical tiles, but concatenate their transposes along the
+// dense-column dimension:
+//
+//   A_wide^T = [A_0^T | A_1^T | ...]
+//   C_wide^T = [C_0^T | C_1^T | ...]
+//   C_wide^T = B^T * A_wide^T + C_wide^T
+//
+// Every group of 16 dense columns is still one independent WMMA-equivalent
+// tile.  Concatenation only removes tiny-matrix batching/dispatch overhead; it
+// does not mix tiles or add arithmetic.
+constexpr int kTileColumns = WMMA_M;
+constexpr int kSelfTestRepeats = 3;
+
+__global__ void buildWidePowerTransposeKernel(
+    const float* __restrict__ input,
+    float* __restrict__ power_t,
+    int n,
+    int rows_pad,
+    int terms,
+    int ipr,
+    BasisKind basis,
+    const int* __restrict__ positions) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= n) return;
+
+  const int packed_row = index / ipr;
+  const int slot = index % ipr;
+  const float x = input[index];
+
+  for (int term = 0; term < terms; ++term) {
+    const int k = positions[slot * terms + term];
+    const __half rounded = __float2half(powerFor(x, term, basis));
+    // A^T is row-major: A^T[k, packed_row].  Keeping the long dense
+    // dimension contiguous is the layout recommended for CSR_ALG2.
+    power_t[size_t(k) * rows_pad + packed_row] = __half2float(rounded);
+  }
+}
+
+__global__ void postprocessWideTransposeKernel(
+    const float* __restrict__ result_t,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const int* __restrict__ funcs,
+    int num_funcs,
+    int n,
+    int rows_pad,
+    int ipr,
+    const int* __restrict__ output_groups) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= n) return;
+
+  const int packed_row = index / ipr;
+  const int slot = index % ipr;
+  const float x = input[index];
+
+  for (int f = 0; f < num_funcs; ++f) {
+    const FunctionId function = static_cast<FunctionId>(funcs[f]);
+    const int output_column = output_groups[f] * ipr + slot;
+    const float residual =
+        result_t[size_t(output_column) * rows_pad + packed_row];
+    output[size_t(f) * n + index] =
+        needsMultiplyByX(function) ? residual * x : residual;
+  }
+}
+
+void launchBuildWidePowerTranspose(
+    const EngineContext& ctx,
+    float* power_t,
+    int rows_pad,
+    cudaStream_t stream) {
+  TACT_CUDA_CHECK(cudaMemsetAsync(
+      power_t, 0,
+      size_t(WMMA_K) * rows_pad * sizeof(float), stream));
+  constexpr int block = 256;
+  const int grid = (ctx.opt->n + block - 1) / block;
+  buildWidePowerTransposeKernel<<<grid, block, 0, stream>>>(
+      ctx.d_in, power_t, ctx.opt->n, rows_pad, ctx.opt->terms,
+      ctx.spec.ipr, ctx.spec.basis, ctx.d_positions);
+  TACT_CUDA_CHECK(cudaGetLastError());
+}
+
+void launchPostprocessWideTranspose(
+    const EngineContext& ctx,
+    const float* result_t,
+    int rows_pad,
+    cudaStream_t stream) {
+  constexpr int block = 256;
+  const int grid = (ctx.opt->n + block - 1) / block;
+  postprocessWideTransposeKernel<<<grid, block, 0, stream>>>(
+      result_t, ctx.d_in, ctx.d_out, ctx.d_funcs, ctx.spec.num_funcs,
+      ctx.opt->n, rows_pad, ctx.spec.ipr, ctx.d_output_groups);
+  TACT_CUDA_CHECK(cudaGetLastError());
+}
+
+class CuSparseEngine final : public Engine {
  public:
-  explicit CuSparseLtEngine(EngineContext ctx) : ctx_(ctx) {
+  explicit CuSparseEngine(EngineContext ctx) : ctx_(ctx) {
     const Options& opt = *ctx_.opt;
-    if (opt.layout != LAYOUT_SPARSE24) {
-      throw UnsupportedError(
-          "cuSPARSELt backend requires --layout sparse24.");
-    }
+    rows_ = (opt.n + ctx_.spec.ipr - 1) / ctx_.spec.ipr;
+    // Preserve exact WMMA tile boundaries.  Sixteen consecutive columns of
+    // A^T/C^T correspond to one 16x16 WMMA tile.
+    rows_pad_ = roundUp(rows_, kTileColumns);
+    tile_count_ = rows_pad_ / kTileColumns;
 
-    int device = 0;
-    TACT_CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop{};
-    TACT_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    if (prop.major < 8) {
-      throw UnsupportedError("cuSPARSELt sparse tensor cores require Ampere "
-                             "or newer (SM 8.0+). Current device is SM " +
-                             std::to_string(prop.major) + "." +
-                             std::to_string(prop.minor));
-    }
-
-    rows_total_ = (opt.n + ctx_.spec.ipr - 1) / ctx_.spec.ipr;
-    // Keep each reusable chunk bounded and divisible by 16. cuSPARSELt caps
-    // each C/D dimension at 2,097,120; this value also satisfies FP16 shape
-    // multiples for the dense descriptors.
-    constexpr int max_chunk_rows = 2097120;
-    int chunk_count =
-        (rows_total_ + max_chunk_rows - 1) / max_chunk_rows;
-    chunk_rows_pad_ = roundUp(
-        (rows_total_ + chunk_count - 1) / chunk_count, 16);
-    if (chunk_rows_pad_ <= 0) chunk_rows_pad_ = 16;
-
-    d_powerRows_.allocate(size_t(chunk_rows_pad_) * WMMA_K * sizeof(__half));
-    d_cth_.allocate(size_t(OUT_PAD) * chunk_rows_pad_ * sizeof(__half));
-
-    // Important: to follow NVIDIA's cuSPARSELt sample, use row-major storage
-    // with opA=T and opB=T. The physical sparse A is K x N, so opA(A) is the
-    // logical coefficient matrix B^T: N x K. This avoids the NOT_SUPPORTED /
-    // operation-not-permitted descriptor combination hit by row-major NN.
-    auto coefficients = buildCoefficientLayout(
+    const auto coefficients = buildCoefficientLayout(
         opt.funcs, opt.terms, ctx_.spec.ipr,
         ctx_.spec.positions, ctx_.spec.output_groups);
-    if (!isCoefficientSparse24(coefficients.physical)) {
-      throw std::runtime_error(
-          "Generated physical coefficient matrix violates 2:4 sparsity.");
+
+    std::vector<int> row_offsets;
+    std::vector<int> columns;
+    std::vector<__half> half_values;
+    // Builds CSR of the transposed coefficient matrix B^T (size N x K).
+    buildCoefficientCsrTranspose(
+        coefficients.physical, WMMA_N, WMMA_K,
+        row_offsets, columns, half_values);
+
+    host_row_offsets_ = row_offsets;
+    host_columns_ = columns;
+    host_values_.resize(half_values.size());
+    for (size_t i = 0; i < half_values.size(); ++i) {
+      // Match WMMA operands numerically: coefficients are rounded to FP16
+      // once, then widened to FP32 because uniform FP32 is the robust CSR
+      // SpMM datatype combination on CUDA 12.0.
+      host_values_[i] = __half2float(half_values[i]);
     }
-    d_sparseA_.allocate(size_t(WMMA_K) * OUT_PAD * sizeof(__half));
-    TACT_CUDA_CHECK(cudaMemcpy(d_sparseA_.as<__half>(),
-                               coefficients.physical.data(),
-                               coefficients.physical.size() * sizeof(__half),
-                               cudaMemcpyHostToDevice));
+    nnz_ = static_cast<int64_t>(host_values_.size());
+    validateCsrAgainstDense(coefficients.physical);
 
-    TACT_CUSPARSELT_CHECK(cusparseLtInit(&handle_));
-#if CUSPARSELT_VERSION >= 400
-    int runtime_version = 0;
-    TACT_CUSPARSELT_CHECK(cusparseLtGetVersion(&handle_, &runtime_version));
-    if (runtime_version / 100 != CUSPARSELT_VERSION / 100) {
-      throw UnsupportedError(
-          "cuSPARSELt runtime/header ABI mismatch: compiled with " +
-          std::to_string(CUSPARSELT_VERSION) + ", loaded " +
-          std::to_string(runtime_version) + ". Reconfigure with one matching "
-          "CUSPARSELT_ROOT archive.");
-    }
-#endif
-    constexpr int alignment = 16;
+    d_row_offsets_.allocate(host_row_offsets_.size() * sizeof(int));
+    d_columns_.allocate(host_columns_.size() * sizeof(int));
+    d_values_.allocate(host_values_.size() * sizeof(float));
+    d_power_t_.allocate(size_t(WMMA_K) * rows_pad_ * sizeof(float));
+    d_result_t_.allocate(size_t(WMMA_N) * rows_pad_ * sizeof(float));
 
-    // opA=T: physical A dimensions are K x M = 16 x 16.
-    TACT_CUSPARSELT_CHECK(cusparseLtStructuredDescriptorInit(&handle_, &matA_,
-                                                             WMMA_K, OUT_PAD, OUT_PAD,
-                                                             alignment, CUDA_R_16F, CUSPARSE_ORDER_ROW,
-                                                             CUSPARSELT_SPARSITY_50_PERCENT));
-    // opB=T: physical B dimensions are N x K = chunk_rows_pad x 16.
-    TACT_CUSPARSELT_CHECK(cusparseLtDenseDescriptorInit(&handle_, &matB_,
-                                                        chunk_rows_pad_, WMMA_K, WMMA_K,
-                                                        alignment, CUDA_R_16F, CUSPARSE_ORDER_ROW));
-    // D = C shape is M x N = 16 x chunk_rows_pad.
-    TACT_CUSPARSELT_CHECK(cusparseLtDenseDescriptorInit(&handle_, &matC_,
-                                                        OUT_PAD, chunk_rows_pad_, chunk_rows_pad_,
-                                                        alignment, CUDA_R_16F, CUSPARSE_ORDER_ROW));
+    TACT_CUDA_CHECK(cudaMemcpy(
+        d_row_offsets_.as<int>(), host_row_offsets_.data(),
+        host_row_offsets_.size() * sizeof(int), cudaMemcpyHostToDevice));
+    TACT_CUDA_CHECK(cudaMemcpy(
+        d_columns_.as<int>(), host_columns_.data(),
+        host_columns_.size() * sizeof(int), cudaMemcpyHostToDevice));
+    TACT_CUDA_CHECK(cudaMemcpy(
+        d_values_.as<float>(), host_values_.data(),
+        host_values_.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-    // cuSPARSELt 0.4 (the bundled archive) does not define
-    // CUSPARSE_COMPUTE_32F.  Its FP16 Tensor Core path uses
-    // CUSPARSE_COMPUTE_16F.  Newer releases add FP32 accumulation, so use it
-    // when the API version provides it while remaining source-compatible with
-    // the bundled 0.4 headers/library pair.  Alpha and beta remain float, as
-    // required by cuSPARSELt for both compute modes.
-#if CUSPARSELT_VERSION >= 500
-    constexpr cusparseComputeType compute_type = CUSPARSE_COMPUTE_32F;
-#else
-    constexpr cusparseComputeType compute_type = CUSPARSE_COMPUTE_16F;
-#endif
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulDescriptorInit(&handle_, &matmul_,
-                                                         CUSPARSE_OPERATION_TRANSPOSE,
-                                                         CUSPARSE_OPERATION_TRANSPOSE,
-                                                         &matA_, &matB_, &matC_, &matC_,
-                                                         compute_type));
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulAlgSelectionInit(&handle_, &alg_sel_, &matmul_,
-                                                           CUSPARSELT_MATMUL_ALG_DEFAULT));
-#if CUSPARSELT_VERSION < 400
-    // cuSPARSELt 0.3 exposes a workspace-size limit in PlanInit. Zero asks for
-    // the default plan; MatmulGetWorkspace below reports its actual allocation.
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulPlanInit(&handle_, &plan_, &matmul_, &alg_sel_, 0));
-#else
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulPlanInit(&handle_, &plan_, &matmul_, &alg_sel_));
-#endif
+    TACT_CUSPARSE_CHECK(cusparseCreate(&handle_));
+    TACT_CUSPARSE_CHECK(cusparseCreateCsr(
+        &mat_coeff_t_, WMMA_N, WMMA_K, nnz_,
+        d_row_offsets_.as<int>(), d_columns_.as<int>(),
+        d_values_.as<float>(), CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
+        CUDA_R_32F));
 
-#if CUSPARSELT_VERSION >= 500
-    void* sparse_ptr_for_desc = d_sparseA_.ptr;
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulDescSetAttribute(&handle_, &matmul_,
-                                                           CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
-                                                           &sparse_ptr_for_desc,
-                                                           sizeof(sparse_ptr_for_desc)));
-#endif
+    // One wide dense matrix, but still exact independent 16-column tile
+    // groups.  Row-major gives contiguous access across the long dimension.
+    TACT_CUSPARSE_CHECK(cusparseCreateDnMat(
+        &mat_power_t_, WMMA_K, rows_pad_, rows_pad_,
+        d_power_t_.as<float>(), CUDA_R_32F, CUSPARSE_ORDER_ROW));
+    TACT_CUSPARSE_CHECK(cusparseCreateDnMat(
+        &mat_result_t_, WMMA_N, rows_pad_, rows_pad_,
+        d_result_t_.as<float>(), CUDA_R_32F, CUSPARSE_ORDER_ROW));
 
-    DeviceBuffer d_valid(sizeof(int));
-    TACT_CUDA_CHECK(cudaMemset(d_valid.ptr, 0, sizeof(int)));
-    TACT_CUSPARSELT_CHECK(cusparseLtSpMMAPruneCheck(&handle_, &matmul_,
-                                                    d_sparseA_.as<__half>(),
-                                                    d_valid.as<int>(), nullptr));
-    TACT_CUDA_CHECK(cudaDeviceSynchronize());
-    int is_valid = 1;
-    TACT_CUDA_CHECK(cudaMemcpy(&is_valid, d_valid.as<int>(), sizeof(int), cudaMemcpyDeviceToHost));
-    if (is_valid != 0) {
-      throw std::runtime_error("Generated coefficient matrix is not valid for cuSPARSELt 2:4 structured sparsity.");
-    }
-
-    size_t compressed_size = 0;
-#if CUSPARSELT_VERSION < 400
-    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompressedSize(&handle_, &plan_,
-                                                        &compressed_size));
-    d_compressed_.allocate(compressed_size);
-    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompress(&handle_, &plan_,
-                                                  d_sparseA_.as<__half>(),
-                                                  d_compressed_.ptr,
-                                                  nullptr));
-#else
-    size_t compressed_buffer_size = 0;
-    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompressedSize(&handle_, &plan_,
-                                                        &compressed_size,
-                                                        &compressed_buffer_size));
-    d_compressed_.allocate(compressed_size);
-    d_compressed_buffer_.allocate(compressed_buffer_size);
-    TACT_CUSPARSELT_CHECK(cusparseLtSpMMACompress(&handle_, &plan_,
-                                                  d_sparseA_.as<__half>(),
-                                                  d_compressed_.ptr,
-                                                  d_compressed_buffer_.ptr,
-                                                  nullptr));
-#endif
+    // Input is already on the device before engine construction.  Build it
+    // once here for algorithm selection and the mandatory validation gate.
+    launchBuildWidePowerTranspose(ctx_, d_power_t_.as<float>(), rows_pad_, 0);
     TACT_CUDA_CHECK(cudaDeviceSynchronize());
 
-    size_t workspace_size = 0;
-    TACT_CUSPARSELT_CHECK(cusparseLtMatmulGetWorkspace(&handle_, &plan_, &workspace_size));
-    d_workspace_.allocate(workspace_size);
+    chooseFastestSupportedAlgorithm();
+    runMandatoryWideSelfTest();
+    graph_ready_ = tryCaptureStressGraph();
   }
 
-  ~CuSparseLtEngine() override {
-    cusparseLtMatmulPlanDestroy(&plan_);
-#if CUSPARSELT_VERSION >= 500
-    cusparseLtMatmulAlgSelectionDestroy(&alg_sel_);
-#endif
-    cusparseLtMatDescriptorDestroy(&matA_);
-    cusparseLtMatDescriptorDestroy(&matB_);
-    cusparseLtMatDescriptorDestroy(&matC_);
-    cusparseLtDestroy(&handle_);
+  ~CuSparseEngine() override {
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (mat_coeff_t_) cusparseDestroySpMat(mat_coeff_t_);
+    if (mat_power_t_) cusparseDestroyDnMat(mat_power_t_);
+    if (mat_result_t_) cusparseDestroyDnMat(mat_result_t_);
+    if (handle_) cusparseDestroy(handle_);
   }
 
   void run(cudaStream_t stream = nullptr) override {
-    int processed = 0;
-    while (processed < rows_total_) {
-      launchBuildPowerRowsChunk(ctx_.d_in, d_powerRows_.as<__half>(), ctx_.opt->n,
-                                processed, chunk_rows_pad_, ctx_.opt->terms,
-                                ctx_.spec.ipr, ctx_.spec.basis, ctx_.d_positions, stream);
-      launchFillHalfOnes(d_cth_.as<__half>(),
-                         size_t(OUT_PAD) * chunk_rows_pad_, stream);
-      multiplyRepeated(stream);
-      launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
-                          ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
-                          processed, chunk_rows_pad_, ctx_.spec.ipr,
-                          ctx_.d_output_groups, stream);
-      processed += chunk_rows_pad_;
-    }
+    TACT_CUSPARSE_CHECK(cusparseSetStream(handle_, stream));
+    launchBuildWidePowerTranspose(ctx_, d_power_t_.as<float>(), rows_pad_, stream);
+    launchFillFloatOnes(
+        d_result_t_.as<float>(), size_t(WMMA_N) * rows_pad_, stream);
+    multiplyRepeated(stream);
+    launchPostprocessWideTranspose(
+        ctx_, d_result_t_.as<float>(), rows_pad_, stream);
   }
 
   SectionTimes runProfile(cudaStream_t stream = nullptr) override {
-    SectionTimes st;
-    GpuTimer total, phase;
+    TACT_CUSPARSE_CHECK(cusparseSetStream(handle_, stream));
+    SectionTimes times;
+    GpuTimer total;
+    GpuTimer phase;
     total.tic(stream);
-    int processed = 0;
-    while (processed < rows_total_) {
-      phase.tic(stream);
-      launchBuildPowerRowsChunk(ctx_.d_in, d_powerRows_.as<__half>(), ctx_.opt->n,
-                                processed, chunk_rows_pad_, ctx_.opt->terms,
-                                ctx_.spec.ipr, ctx_.spec.basis, ctx_.d_positions, stream);
-      launchFillHalfOnes(d_cth_.as<__half>(),
-                         size_t(OUT_PAD) * chunk_rows_pad_, stream);
-      st.build_power_ms += phase.toc(stream);
 
-      phase.tic(stream);
-      multiplyRepeated(stream);
-      st.matmul_ms += phase.toc(stream);
+    phase.tic(stream);
+    launchBuildWidePowerTranspose(ctx_, d_power_t_.as<float>(), rows_pad_, stream);
+    launchFillFloatOnes(
+        d_result_t_.as<float>(), size_t(WMMA_N) * rows_pad_, stream);
+    times.build_power_ms = phase.toc(stream);
 
-      phase.tic(stream);
-      launchPostHalfChunk(d_cth_.as<__half>(), ctx_.d_in, ctx_.d_out,
-                          ctx_.d_funcs, ctx_.spec.num_funcs, ctx_.opt->n,
-                          processed, chunk_rows_pad_, ctx_.spec.ipr,
-                          ctx_.d_output_groups, stream);
-      st.postprocess_ms += phase.toc(stream);
-      processed += chunk_rows_pad_;
-    }
-    st.total_ms = total.toc(stream);
-    return st;
+    phase.tic(stream);
+    multiplyRepeated(stream);
+    times.matmul_ms = phase.toc(stream);
+
+    phase.tic(stream);
+    launchPostprocessWideTranspose(
+        ctx_, d_result_t_.as<float>(), rows_pad_, stream);
+    times.postprocess_ms = phase.toc(stream);
+
+    times.total_ms = total.toc(stream);
+    return times;
+  }
+
+  bool copyIntermediate(std::vector<float>& values,
+                        int& leading_dimension) override {
+    values.resize(size_t(WMMA_N) * rows_pad_);
+    TACT_CUDA_CHECK(cudaMemcpy(
+        values.data(), d_result_t_.as<float>(),
+        values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    leading_dimension = rows_pad_;
+    return true;
   }
 
  private:
-  void multiplyRepeated(cudaStream_t stream) {
-    const float alpha = 1.0f;
-    const float beta = 1.0f;
-    cudaStream_t stream_array[1] = {stream};
-    cudaStream_t* streams = stream ? stream_array : nullptr;
-    const int num_streams = stream ? 1 : 0;
+  void validateCsrAgainstDense(const std::vector<__half>& dense_b) const {
+    for (int output_column = 0; output_column < WMMA_N; ++output_column) {
+      for (int k = 0; k < WMMA_K; ++k) {
+        float reconstructed = 0.0f;
+        for (int p = host_row_offsets_[output_column];
+             p < host_row_offsets_[output_column + 1]; ++p) {
+          if (host_columns_[p] == k) {
+            reconstructed = host_values_[p];
+            break;
+          }
+        }
+        const float expected =
+            __half2float(dense_b[k * WMMA_N + output_column]);
+        if (reconstructed != expected) {
+          std::ostringstream oss;
+          oss << "cuSPARSE CSR validation failed at B^T["
+              << output_column << ',' << k << "]: got "
+              << reconstructed << ", expected " << expected;
+          throw std::runtime_error(oss.str());
+        }
+      }
+    }
+  }
 
-    // Exact TACT stress semantics: C is initialized to one once, then only the
-    // structured sparse matmul is repeated. C and D intentionally alias, as in
-    // NVIDIA's sample, so every call performs C = A*B + C.
+  void createCoefficientDescriptor(cusparseSpMatDescr_t* descriptor) {
+    // cusparseCreateCsr follows the official NVIDIA sample and accepts
+    // mutable device pointers (void*), even though SpMM only reads them.
+    // Use DeviceBuffer::ptr directly here; calling the as<T>() overload
+    // produced const T* and failed to compile with CUDA 12.0.
+    TACT_CUSPARSE_CHECK(cusparseCreateCsr(
+        descriptor, WMMA_N, WMMA_K, nnz_,
+        d_row_offsets_.ptr, d_columns_.ptr, d_values_.ptr,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+  }
+
+  bool queryBufferSize(cusparseSpMatDescr_t coefficient_descriptor,
+                       cusparseSpMMAlg_t algorithm,
+                       size_t& size_out) const {
+    size_out = 0;
+    const cusparseStatus_t status = cusparseSpMM_bufferSize(
+        handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha_, coefficient_descriptor, mat_power_t_, &beta_, mat_result_t_,
+        CUDA_R_32F, algorithm, &size_out);
+    return status == CUSPARSE_STATUS_SUCCESS;
+  }
+
+  bool preprocessConfiguration(cusparseSpMatDescr_t coefficient_descriptor,
+                               cusparseSpMMAlg_t algorithm,
+                               DeviceBuffer& buffer) {
+    const cusparseStatus_t status = cusparseSpMM_preprocess(
+        handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha_, coefficient_descriptor, mat_power_t_, &beta_, mat_result_t_,
+        CUDA_R_32F, algorithm, buffer.ptr);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      cudaGetLastError();
+      return false;
+    }
+    TACT_CUDA_CHECK(cudaDeviceSynchronize());
+    return true;
+  }
+
+  std::vector<float> buildFirstTileExpected(int repeats) const {
+    const int inputs_per_tile = WMMA_M * ctx_.spec.ipr;
+    const int input_count = std::min(ctx_.opt->n, inputs_per_tile);
+
+    std::vector<float> host_input(
+        static_cast<size_t>(input_count), 0.0f);
+    TACT_CUDA_CHECK(cudaMemcpy(
+        host_input.data(), ctx_.d_in,
+        host_input.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // A_tile^T is represented in row-major order: [k, packed_row].
+    std::vector<float> host_power(
+        size_t(WMMA_K) * WMMA_M, 0.0f);
+    for (int index = 0; index < input_count; ++index) {
+      const int packed_row = index / ctx_.spec.ipr;
+      const int slot = index % ctx_.spec.ipr;
+      const float x = host_input[index];
+      for (int term = 0; term < ctx_.opt->terms; ++term) {
+        const int k =
+            ctx_.spec.positions[slot * ctx_.opt->terms + term];
+        host_power[size_t(k) * WMMA_M + packed_row] = __half2float(
+            __float2half(powerFor(x, term, ctx_.spec.basis)));
+      }
+    }
+
+    std::vector<float> expected(
+        size_t(WMMA_N) * WMMA_M, 1.0f);
+    for (int output_column = 0; output_column < WMMA_N;
+         ++output_column) {
+      for (int packed_row = 0; packed_row < WMMA_M; ++packed_row) {
+        float dot = 0.0f;
+        for (int p = host_row_offsets_[output_column];
+             p < host_row_offsets_[output_column + 1]; ++p) {
+          const int k = host_columns_[p];
+          dot += host_values_[p] *
+              host_power[size_t(k) * WMMA_M + packed_row];
+        }
+        expected[size_t(output_column) * WMMA_M + packed_row] +=
+            float(repeats) * dot;
+      }
+    }
+    return expected;
+  }
+
+  std::vector<float> copyFirstTileResult() const {
+    std::vector<float> actual(
+        size_t(WMMA_N) * WMMA_M, 0.0f);
+    // The production C_wide^T descriptor is row-major with rows_pad_ columns.
+    // Copy the first 16 columns of each of its 16 rows.  This is exactly the
+    // first independent WMMA-equivalent 16x16 tile, but it is read from the
+    // real production allocation and descriptor rather than a special test
+    // descriptor.
+    TACT_CUDA_CHECK(cudaMemcpy2D(
+        actual.data(), size_t(WMMA_M) * sizeof(float),
+        d_result_t_.as<float>(), size_t(rows_pad_) * sizeof(float),
+        size_t(WMMA_M) * sizeof(float), WMMA_N,
+        cudaMemcpyDeviceToHost));
+    return actual;
+  }
+
+  bool validateFirstTile(const std::vector<float>& actual,
+                         const std::vector<float>& expected,
+                         std::string& error_out) const {
+    for (size_t i = 0; i < actual.size(); ++i) {
+      const float abs_error = std::abs(actual[i] - expected[i]);
+      const float tolerance =
+          2.0e-4f + 2.0e-5f * std::abs(expected[i]);
+      if (abs_error > tolerance) {
+        const int output_column = int(i / WMMA_M);
+        const int packed_row = int(i % WMMA_M);
+        std::ostringstream oss;
+        oss << "C_wide^T first-tile mismatch at ["
+            << output_column << ',' << packed_row << "]: got "
+            << actual[i] << ", expected " << expected[i]
+            << ", abs_error " << abs_error;
+        error_out = oss.str();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool runWideSelfTest(cusparseSpMatDescr_t coefficient_descriptor,
+                       cusparseSpMMAlg_t algorithm,
+                       DeviceBuffer& buffer,
+                       int repeats,
+                       std::string& error_out) {
+    launchFillFloatOnes(
+        d_result_t_.as<float>(), size_t(WMMA_N) * rows_pad_, 0);
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+      const cusparseStatus_t status = cusparseSpMM(
+          handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_NON_TRANSPOSE,
+          &alpha_, coefficient_descriptor, mat_power_t_, &beta_, mat_result_t_,
+          CUDA_R_32F, algorithm, buffer.ptr);
+      if (status != CUSPARSE_STATUS_SUCCESS) {
+        std::ostringstream oss;
+        oss << "cusparseSpMM returned " << cusparseGetErrorString(status)
+            << " during mandatory wide-layout validation";
+        error_out = oss.str();
+        cudaGetLastError();
+        return false;
+      }
+    }
+    TACT_CUDA_CHECK(cudaDeviceSynchronize());
+
+    const std::vector<float> expected = buildFirstTileExpected(repeats);
+    const std::vector<float> actual = copyFirstTileResult();
+    return validateFirstTile(actual, expected, error_out);
+  }
+
+  float benchmarkAlgorithm(cusparseSpMatDescr_t coefficient_descriptor,
+                           cusparseSpMMAlg_t algorithm,
+                           DeviceBuffer& candidate_buffer) {
+    launchFillFloatOnes(
+        d_result_t_.as<float>(), size_t(WMMA_N) * rows_pad_, 0);
+    TACT_CUSPARSE_CHECK(cusparseSpMM(
+        handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha_, coefficient_descriptor, mat_power_t_, &beta_, mat_result_t_,
+        CUDA_R_32F, algorithm, candidate_buffer.ptr));
+    TACT_CUDA_CHECK(cudaDeviceSynchronize());
+
+    launchFillFloatOnes(
+        d_result_t_.as<float>(), size_t(WMMA_N) * rows_pad_, 0);
+    GpuTimer timer;
+    timer.tic();
+    constexpr int trials = 4;
+    for (int i = 0; i < trials; ++i) {
+      TACT_CUSPARSE_CHECK(cusparseSpMM(
+          handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_NON_TRANSPOSE,
+          &alpha_, coefficient_descriptor, mat_power_t_, &beta_, mat_result_t_,
+          CUDA_R_32F, algorithm, candidate_buffer.ptr));
+    }
+    return timer.toc() / float(trials);
+  }
+
+  void chooseFastestSupportedAlgorithm() {
+    const cusparseSpMMAlg_t candidates[] = {
+        CUSPARSE_SPMM_CSR_ALG2,
+        CUSPARSE_SPMM_CSR_ALG1,
+        CUSPARSE_SPMM_ALG_DEFAULT};
+
+    float best_ms = std::numeric_limits<float>::infinity();
+    bool found = false;
+    std::string last_failure;
+
+    for (cusparseSpMMAlg_t candidate : candidates) {
+      cusparseSpMatDescr_t candidate_coeff = nullptr;
+      createCoefficientDescriptor(&candidate_coeff);
+
+      size_t candidate_size = 0;
+      if (!queryBufferSize(candidate_coeff, candidate, candidate_size)) {
+        cusparseDestroySpMat(candidate_coeff);
+        continue;
+      }
+
+      DeviceBuffer candidate_buffer(candidate_size);
+      // Preprocess only the candidate descriptor.  cuSPARSE may attach
+      // algorithm-specific analysis state to the sparse descriptor; keeping a
+      // private descriptor here prevents one candidate or matrix shape from
+      // contaminating another one.
+      preprocessConfiguration(candidate_coeff, candidate, candidate_buffer);
+
+      std::string validation_error;
+      const bool valid = runWideSelfTest(
+          candidate_coeff, candidate, candidate_buffer,
+          std::max(1, std::min(kSelfTestRepeats,
+                               ctx_.opt->stress_repeat)),
+          validation_error);
+      if (!valid) {
+        last_failure = validation_error;
+        cusparseDestroySpMat(candidate_coeff);
+        continue;
+      }
+
+      float elapsed = std::numeric_limits<float>::infinity();
+      try {
+        elapsed = benchmarkAlgorithm(
+            candidate_coeff, candidate, candidate_buffer);
+      } catch (...) {
+        cudaGetLastError();
+        cusparseDestroySpMat(candidate_coeff);
+        continue;
+      }
+
+      if (elapsed < best_ms) {
+        best_ms = elapsed;
+        algorithm_ = candidate;
+        buffer_size_ = candidate_size;
+        found = true;
+      }
+      cusparseDestroySpMat(candidate_coeff);
+    }
+
+    if (!found) {
+      std::ostringstream oss;
+      oss << "no correct and supported cuSPARSE CSR SpMM algorithm for the "
+             "wide WMMA-equivalent layout";
+      if (!last_failure.empty()) {
+        oss << "; last validation error: " << last_failure;
+      }
+      throw std::runtime_error(oss.str());
+    }
+
+    d_buffer_.allocate(buffer_size_);
+    // Configure only the final production descriptor after algorithm
+    // selection.  This avoids the v11 bug where preprocessing the
+    // production-wide descriptor was then reused with an unrelated 16x16
+    // test descriptor.
+    preprocessConfiguration(mat_coeff_t_, algorithm_, d_buffer_);
+  }
+
+  void runMandatoryWideSelfTest() {
+    const int repeats = std::max(
+        1, std::min(kSelfTestRepeats, ctx_.opt->stress_repeat));
+    std::string error;
+    if (!runWideSelfTest(
+            mat_coeff_t_, algorithm_, d_buffer_, repeats, error)) {
+      throw std::runtime_error(
+          "mandatory cuSPARSE production-layout validation failed: " + error);
+    }
+  }
+
+  bool tryCaptureStressGraph() {
+    if (ctx_.opt->stress_repeat < 2) return false;
+
+    cudaStream_t capture_stream = nullptr;
+    if (cudaStreamCreateWithFlags(
+            &capture_stream, cudaStreamNonBlocking) != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+
+    bool success = false;
+    do {
+      if (cusparseSetStream(handle_, capture_stream) !=
+          CUSPARSE_STATUS_SUCCESS) {
+        break;
+      }
+
+      // Resolve any lazy library setup before capture.
+      if (cudaMemsetAsync(
+              d_result_t_.as<float>(), 0,
+              size_t(WMMA_N) * rows_pad_ * sizeof(float),
+              capture_stream) != cudaSuccess) {
+        break;
+      }
+      if (cusparseSpMM(
+              handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+              CUSPARSE_OPERATION_NON_TRANSPOSE,
+              &alpha_, mat_coeff_t_, mat_power_t_, &beta_, mat_result_t_,
+              CUDA_R_32F, algorithm_, d_buffer_.ptr) !=
+          CUSPARSE_STATUS_SUCCESS) {
+        break;
+      }
+      if (cudaStreamSynchronize(capture_stream) != cudaSuccess) break;
+
+      if (cudaStreamBeginCapture(
+              capture_stream, cudaStreamCaptureModeThreadLocal) !=
+          cudaSuccess) {
+        break;
+      }
+
+      bool calls_ok = true;
+      for (int repeat = 0; repeat < ctx_.opt->stress_repeat; ++repeat) {
+        if (cusparseSpMM(
+                handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                &alpha_, mat_coeff_t_, mat_power_t_, &beta_, mat_result_t_,
+                CUDA_R_32F, algorithm_, d_buffer_.ptr) !=
+            CUSPARSE_STATUS_SUCCESS) {
+          calls_ok = false;
+          break;
+        }
+      }
+
+      cudaGraph_t captured = nullptr;
+      const cudaError_t end_status =
+          cudaStreamEndCapture(capture_stream, &captured);
+      if (!calls_ok || end_status != cudaSuccess || !captured) {
+        if (captured) cudaGraphDestroy(captured);
+        break;
+      }
+      graph_ = captured;
+
+      if (cudaGraphInstantiate(
+              &graph_exec_, graph_, nullptr, nullptr, 0) != cudaSuccess) {
+        cudaGraphDestroy(graph_);
+        graph_ = nullptr;
+        graph_exec_ = nullptr;
+        break;
+      }
+      cudaGraphUpload(graph_exec_, capture_stream);
+      cudaStreamSynchronize(capture_stream);
+      success = true;
+    } while (false);
+
+    cusparseSetStream(handle_, nullptr);
+    cudaStreamDestroy(capture_stream);
+    if (!success) cudaGetLastError();
+    return success;
+  }
+
+  void multiplyRepeated(cudaStream_t stream) {
+    if (graph_ready_) {
+      TACT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream));
+      return;
+    }
+
     for (int repeat = 0; repeat < ctx_.opt->stress_repeat; ++repeat) {
-      TACT_CUSPARSELT_CHECK(cusparseLtMatmul(&handle_, &plan_,
-                                             &alpha,
-                                             d_compressed_.ptr,
-                                             d_powerRows_.as<__half>(),
-                                             &beta,
-                                             d_cth_.as<__half>(),
-                                             d_cth_.as<__half>(),
-                                             d_workspace_.ptr,
-                                             streams, num_streams));
+      TACT_CUSPARSE_CHECK(cusparseSpMM(
+          handle_, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_NON_TRANSPOSE,
+          &alpha_, mat_coeff_t_, mat_power_t_, &beta_, mat_result_t_,
+          CUDA_R_32F, algorithm_, d_buffer_.ptr));
     }
   }
 
   EngineContext ctx_;
-  int rows_total_ = 0;
-  int chunk_rows_pad_ = 0;
-  DeviceBuffer d_powerRows_, d_cth_, d_sparseA_, d_compressed_;
-  DeviceBuffer d_compressed_buffer_, d_workspace_;
-  cusparseLtHandle_t handle_{};
-  cusparseLtMatDescriptor_t matA_{}, matB_{}, matC_{};
-  cusparseLtMatmulDescriptor_t matmul_{};
-  cusparseLtMatmulAlgSelection_t alg_sel_{};
-  cusparseLtMatmulPlan_t plan_{};
+  int rows_ = 0;
+  int rows_pad_ = 0;
+  int tile_count_ = 0;
+  int64_t nnz_ = 0;
+
+  float alpha_ = 1.0f;
+  float beta_ = 1.0f;
+  cusparseSpMMAlg_t algorithm_ = CUSPARSE_SPMM_CSR_ALG2;
+  size_t buffer_size_ = 0;
+
+  std::vector<int> host_row_offsets_;
+  std::vector<int> host_columns_;
+  std::vector<float> host_values_;
+
+  DeviceBuffer d_row_offsets_;
+  DeviceBuffer d_columns_;
+  DeviceBuffer d_values_;
+  DeviceBuffer d_power_t_;
+  DeviceBuffer d_result_t_;
+  DeviceBuffer d_buffer_;
+
+  cusparseHandle_t handle_ = nullptr;
+  cusparseSpMatDescr_t mat_coeff_t_ = nullptr;
+  cusparseDnMatDescr_t mat_power_t_ = nullptr;
+  cusparseDnMatDescr_t mat_result_t_ = nullptr;
+
+  cudaGraph_t graph_ = nullptr;
+  cudaGraphExec_t graph_exec_ = nullptr;
+  bool graph_ready_ = false;
 };
+
 }  // namespace
 
-std::unique_ptr<Engine> makeCuSparseLtEngine(const EngineContext& ctx) {
-  return std::make_unique<CuSparseLtEngine>(ctx);
+std::unique_ptr<Engine> makeCuSparseEngine(const EngineContext& ctx) {
+  return std::make_unique<CuSparseEngine>(ctx);
 }
-#endif
 
 }  // namespace tact

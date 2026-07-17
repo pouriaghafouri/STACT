@@ -165,6 +165,8 @@ for index in "${!case_labels[@]}"; do
     "$THRESHOLD" || exit $?
   run_case "$label" "$description" "$count" "$funcs" "Tensor Core" wmma dense \
     "$THRESHOLD" || exit $?
+  run_case "$label" "$description" "$count" "$funcs" "Sparse Tensor Core PTX" sparse_tc dense \
+    "$THRESHOLD" || exit $?
   run_case "$label" "$description" "$count" "$funcs" cuSPARSE cusparse csr \
     "$THRESHOLD" || exit $?
 done

@@ -1,44 +1,42 @@
 # STACT — Sparse Tensor Accelerated Computation of Transcendentals
 
-STACT is a CUDA research benchmark for comparing four implementations of the
-same transcendental-function workloads:
+STACT is a CUDA/C++ research benchmark for evaluating TACT polynomial
+approximations of transcendental functions on GPU. The benchmark compares five
+execution paths:
 
-- **SP** — standard single-precision CUDA math functions
-- **SFU** — the fast intrinsic kernels used by the reference TACT programs
-- **Tensor Core** — the WMMA implementation of TACT
-- **cuSPARSE** — CSR sparse matrix multiplication using the same TACT
-  coefficient and power matrices
+- **SP** — standard single-precision CUDA math
+- **SFU** — CUDA fast intrinsics used by the reference TACT programs
+- **WMMA** — the original dense 16x16 Tensor Core TACT implementation
+- **cuSPARSE** — generic CSR SpMM baseline
+- **Sparse Tensor Core PTX** — a custom 2:4 structured-sparse TACT engine using
+  direct `mma.sp.sync` instructions
 
-The SP, SFU, and WMMA kernels follow the reference programs in `tact/`.
-
-## Supported benchmark cases
-
-| Case | Functions |
-|---|---|
-| Single | `cos` |
-| Dual | `sin,cos` |
-| Triple | `sin,cos,tan` |
-| Quad | `sin,cos,tan,sinh` |
-
-SFU is available only for the single, dual, and triple cases. The quad case is
-not run with SFU because this project does not define an SFU implementation for
-`sinh`.
-
-The reference TACT polynomial configuration is:
+The main reference workload is:
 
 ```text
-terms = 3
-stress-repeat = 2000
+functions       = sin,cos,tan
+terms           = 3
+N               = 10000000
+stress-repeat   = 2000
+input range     = [-pi/4, pi/4]
+threshold       = 5e-3
 ```
+
+Validation is always enabled and cannot be disabled.
 
 ## Requirements
 
 - Linux
-- CMake 3.22 or newer
-- CUDA Toolkit with cuSPARSE
-- An NVIDIA GPU supporting the selected CUDA architecture
+- CMake 3.22+
+- CUDA Toolkit 12.x
+- An Ampere-or-newer NVIDIA GPU for `sparse_tc`
+- The examples below target `sm_86`
 
-The commands below target `sm_86`.
+The custom engine executes the Ampere warp-level instruction:
+
+```text
+mma.sp.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+```
 
 ## Build
 
@@ -59,55 +57,40 @@ The executable is:
 build/tact_bench
 ```
 
-## Reference program compilation
-
-Compile the standalone programs under `tact/` with the following styles.
-
-Tensor Core:
-
-```bash
-nvcc -O0 -arch=sm_86 tensor_core.cu -o tensor_core
-```
-
-SFU:
-
-```bash
-nvcc -O0 -arch=sm_86 --use_fast_math SFU.cu -o SFU
-```
-
-SP:
-
-```bash
-nvcc -O0 -arch=sm_86 SP.cu -o SP
-```
-
-Replace the generic source and output names with the actual filenames in
-`tact/`.
-
-## Standard experiment configuration
-
-The examples use:
+The default build keeps the legacy CUDA translation units at `-O0`, matching
+the original stress benchmark, and compiles only `sparse_tc_engine.cu` at
+`-O3`. CMake removes its target-wide Release optimization flag before applying
+these per-source choices, so nvcc receives exactly one optimization level per
+translation unit. The following warning must no longer appear:
 
 ```text
-N              = 10000000
-terms          = 3
-stress-repeat  = 2000
-iterations     = 1
-input range    = [-pi/4, pi/4]
-threshold      = 5e-3
+nvcc warning : incompatible redefinition for option 'optimize'
 ```
 
-`N=10000000` is the documented default experiment size. It avoids the much
-larger intermediate allocations produced by `N=100000000` on common 4 GB and
-6 GB GPUs.
+To inspect the actual nvcc command for the custom engine, use a single-job
+verbose build:
 
-## One example for each method
+```bash
+rm -rf build
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build --verbose -j1 2>&1 | tee build_verbose.log
+grep 'sparse_tc_engine.cu' build_verbose.log
+```
 
-### SP
+The `sparse_tc_engine.cu` command should contain `-O3` and must not contain
+`-O0`. Legacy engine commands should contain `-O0` when `TACT_CUDA_O0` is left
+at its default value.
+
+## Custom sparse Tensor Core engine
+
+Run the new engine with:
 
 ```bash
 ./build/tact_bench \
-  --engine baseline_sp \
+  --engine sparse_tc \
+  --layout dense \
   --functions sin,cos,tan \
   --terms 3 \
   --n 10000000 \
@@ -115,7 +98,237 @@ larger intermediate allocations produced by `N=100000000` on common 4 GB and
   --stress-repeat 2000 \
   --threshold 5e-3 \
   --min -0.78539816339 \
-  --max 0.78539816339
+  --max 0.78539816339 \
+  --profile-sections
+```
+
+Accepted aliases are:
+
+```text
+sparse_tc
+sparse-tc
+custom_sparse
+mma_sp
+```
+
+### What this engine does
+
+The WMMA coefficient matrix is sparse, but its original slot-major K ordering
+is not always legal for Ampere 2:4 structured sparsity. The new engine applies
+an exact K permutation:
+
+```text
+original logical K: slot * terms + term
+sparse-TC K:        term * inputs_per_row + slot
+```
+
+The same permutation is applied to the power operand, so the mathematical
+product does not change. For all supported TACT configurations, this term-major
+ordering places at most two nonzero coefficients in each four-wide K group.
+No coefficient is removed, approximated, or changed.
+
+The engine then:
+
+1. transposes and compresses the FP16 coefficient matrix as a legal 2:4 sparse
+   Tensor Core operand;
+2. generates the same FP16-rounded power tile as WMMA;
+3. loads sparse coefficients, powers, metadata, and FP32 accumulators once;
+4. performs the stress loop using direct sparse Tensor Core PTX;
+5. writes final function outputs directly, including the odd-function
+   multiplication by `x`.
+
+No CSR matrix, cuSPARSE descriptor, large intermediate matrix, or separate
+postprocess kernel is used by `sparse_tc`.
+
+### Exact meaning of `stress-repeat`
+
+One sparse PTX instruction has shape `m16n8k16`, so two instructions are needed
+to update a full logical 16x16 TACT tile:
+
+```text
+mma.sp for output columns 0..7
+mma.sp for output columns 8..15
+```
+
+The kernel contains:
+
+```text
+for repeat = 0 .. stress_repeat-1:
+    sparse MMA for columns 0..7
+    sparse MMA for columns 8..15
+```
+
+Therefore, with `--stress-repeat 2000`:
+
+```text
+logical updates per output      = 2000
+physical mma.sp instructions    = 4000 per logical tile
+algebraic repeat collapse       = none
+A/B reload inside stress loop   = none
+C global-memory traffic in loop = none
+```
+
+The loop count is runtime data and the instructions are emitted through
+`asm volatile`. The custom translation unit is compiled at `-O3` so its
+register-only mainloop is optimized, while the volatile instructions prevent
+the 2000 repetitions from being replaced by a multiplication by 2000.
+
+### Timing interpretation
+
+`kernel avg ms` measures the complete fused custom kernel, matching the style
+of the WMMA measurement. Power-tile construction and final output stores occur
+once per tile. Only the two `mma.sp.sync` instructions are inside the 2000-step
+stress loop.
+
+The project does not claim a speedup before measurement. `sparse_tc` is the
+path with the strongest architectural chance of improving on WMMA because it
+combines:
+
+- hardware 2:4 sparse Tensor Core execution;
+- register-resident accumulation;
+- no library-call boundary inside the recurrence;
+- no global result matrix between repetitions.
+
+Actual speed depends on GPU clocks, register allocation, occupancy, and the
+instruction throughput of the target GPU.
+
+## Testing `sparse_tc`
+
+The tests below intentionally grow from one logical tile to the full workload.
+For `sin,cos,tan` with three terms, one logical tile contains 80 inputs.
+
+### 1. One tile, repeat counts 1, 2, and 2000
+
+```bash
+for R in 1 2 2000; do
+  echo "================ sparse_tc: N=80 R=${R} ================"
+  ./build/tact_bench \
+    --engine sparse_tc \
+    --layout dense \
+    --functions sin,cos,tan \
+    --terms 3 \
+    --n 80 \
+    --iterations 1 \
+    --stress-repeat "$R" \
+    --threshold 5e-3 \
+    --min -0.78539816339 \
+    --max 0.78539816339 \
+    --profile-sections
+done
+```
+
+### 2. More than one tile
+
+```bash
+./build/tact_bench \
+  --engine sparse_tc \
+  --layout dense \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 160 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339 \
+  --profile-sections
+```
+
+### 3. Tail handling
+
+`N=83` creates one complete 80-input tile plus a partial tile.
+
+```bash
+./build/tact_bench \
+  --engine sparse_tc \
+  --layout dense \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 83 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339 \
+  --profile-sections
+```
+
+### 4. Full correctness and performance run
+
+```bash
+./build/tact_bench \
+  --engine sparse_tc \
+  --layout dense \
+  --functions sin,cos,tan \
+  --terms 3 \
+  --n 10000000 \
+  --iterations 1 \
+  --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 \
+  --max 0.78539816339 \
+  --profile-sections
+```
+
+Every valid invocation must exit with status zero and report both validation
+gates as zero failures:
+
+```text
+failures:      0
+sparse-TC/WMMA parity:
+  failures:    0
+```
+
+The first `failures` line checks every output against the independent host
+FP16-rounded TACT model. The parity line independently compares every output
+against the WMMA engine. A failure in either gate returns exit status `2`.
+
+### 5. Direct WMMA comparison
+
+Run both engines with identical arguments and compare `kernel avg ms`.
+
+```bash
+echo "================ WMMA ================"
+./build/tact_bench \
+  --engine wmma --layout dense \
+  --functions sin,cos,tan --terms 3 \
+  --n 10000000 --iterations 1 --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339 \
+  --profile-sections
+
+echo "================ sparse_tc ================"
+./build/tact_bench \
+  --engine sparse_tc --layout dense \
+  --functions sin,cos,tan --terms 3 \
+  --n 10000000 --iterations 1 --stress-repeat 2000 \
+  --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339 \
+  --profile-sections
+```
+
+For a less noisy timing comparison after correctness has passed, repeat the
+same commands with `--iterations 5`. Validation remains mandatory.
+
+A convenience script runs all small tests and can optionally run the full
+10-million-input case:
+
+```bash
+bash scripts/test_sparse_tc.sh
+FULL=1 bash scripts/test_sparse_tc.sh
+```
+
+## Full comparison commands
+
+### SP
+
+```bash
+./build/tact_bench \
+  --engine baseline_sp \
+  --functions sin,cos,tan \
+  --terms 3 --n 10000000 --iterations 1 \
+  --stress-repeat 2000 --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339
 ```
 
 ### SFU
@@ -124,220 +337,75 @@ larger intermediate allocations produced by `N=100000000` on common 4 GB and
 ./build/tact_bench \
   --engine baseline_fast \
   --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
+  --terms 3 --n 10000000 --iterations 1 \
+  --stress-repeat 2000 --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339
 ```
 
-### Tensor Core / WMMA
+### Dense Tensor Core / WMMA
 
 ```bash
 ./build/tact_bench \
-  --engine wmma \
-  --layout dense \
+  --engine wmma --layout dense \
   --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
+  --terms 3 --n 10000000 --iterations 1 \
+  --stress-repeat 2000 --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339
 ```
 
-### cuSPARSE
+### Custom sparse Tensor Core PTX
 
 ```bash
 ./build/tact_bench \
-  --engine cusparse \
-  --layout csr \
+  --engine sparse_tc --layout dense \
   --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
+  --terms 3 --n 10000000 --iterations 1 \
+  --stress-repeat 2000 --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339 \
+  --profile-sections
 ```
 
-## Copy-paste all methods
+### cuSPARSE baseline
 
 ```bash
-echo "================ SP ================"
 ./build/tact_bench \
-  --engine baseline_sp \
+  --engine cusparse --layout csr \
   --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
-
-echo "================ SFU ================"
-./build/tact_bench \
-  --engine baseline_fast \
-  --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
-
-echo "============ Tensor Core ==========="
-./build/tact_bench \
-  --engine wmma \
-  --layout dense \
-  --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
-
-echo "============= cuSPARSE ============="
-./build/tact_bench \
-  --engine cusparse \
-  --layout csr \
-  --functions sin,cos,tan \
-  --terms 3 \
-  --n 10000000 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339
+  --terms 3 --n 10000000 --iterations 1 \
+  --stress-repeat 2000 --threshold 5e-3 \
+  --min -0.78539816339 --max 0.78539816339 \
+  --profile-sections
 ```
 
 ## Mandatory validation
 
-Validation is always enabled. There is no enable/disable validation flag.
-Every command exits with status `2` when validation fails.
+SP and SFU use a deterministic device replay. Matrix engines are checked
+against an independent host model that rounds powers and coefficients to FP16
+before FP32 accumulation.
 
-The output reports:
+Both sparse engines also receive a complete output parity check against WMMA:
 
-- number of validated function outputs
-- maximum absolute error
-- maximum relative error
-- total failure count
-- per-function maximum errors and failure counts
+- `cuSPARSE/WMMA parity`
+- `sparse-TC/WMMA parity`
 
-Validation is performed outside the timed benchmark region.
+All `N * number_of_functions` outputs are checked. A validation or parity
+failure returns exit status `2`.
 
-### SP and SFU validation
-
-SP and SFU use a full second device replay from the original input and compare
-all `N * F` outputs. This checks deterministic execution, indexing, state
-updates, and output placement without using host `libm` as a false reference
-for a 2000-step CUDA state chain.
-
-### Tensor Core validation
-
-WMMA compares every output against an independent host implementation of the
-TACT polynomial. The host model applies the same FP16 rounding to powers and
-coefficients and evaluates:
+The host acceptance rule is unchanged:
 
 ```text
-C = 1 + stress_repeat * (A * B)
+absolute_error <= threshold OR relative_error <= threshold
 ```
 
-### cuSPARSE validation
+## Full sweep
 
-cuSPARSE has two mandatory full-output checks:
-
-1. comparison against the independent host FP16-rounded TACT model
-2. direct output parity comparison against the trusted WMMA implementation
-
-A valid cuSPARSE run must report zero failures in both sections.
-
-## Why the previous cuSPARSE path was very slow
-
-The previous implementation called `cusparseSpMM()` 2000 times. For the triple
-case with `N=10000000`, the result matrix contains about 30 million FP32 values.
-Each repetition therefore read and wrote a very large result matrix from global
-memory. WMMA does not have that cost because its accumulator remains inside the
-warp fragment during the 2000 `mma_sync` operations.
-
-The repeated sparse recurrence is linear:
-
-```text
-C_0     = 1
-C_(r+1) = B^T * A^T + C_r
-```
-
-Therefore:
-
-```text
-C_R = 1 + R * (B^T * A^T)
-```
-
-The cuSPARSE engine now computes the same final algebra with one SpMM call:
-
-```text
-alpha = stress_repeat
-beta  = 1
-C     = alpha * (B^T * A^T) + beta * C
-```
-
-It also omits zero-only K rows and output rows from the cuSPARSE descriptors and
-buffers. This removes the 2000 large global-memory result updates that caused
-the multi-second runtime. The mandatory host validation and WMMA parity check
-verify the final result.
-
-This optimization means `stress-repeat` is an **effective algebraic repeat
-count** for cuSPARSE rather than 2000 physical library calls. The program prints
-this explicitly in the cuSPARSE kernel path.
-
-## Matrix formulation
-
-The logical Tensor Core operation is:
-
-```text
-C = A * B
-```
-
-- `A` contains FP16 input powers.
-- `B` contains FP16 Taylor coefficients.
-- `C` uses FP32 accumulation.
-
-cuSPARSE computes the transposed equivalent:
-
-```text
-C^T = B^T * A^T
-```
-
-The coefficient matrix is stored as CSR. For the triple three-term case:
-
-```text
-inputs per row = 5
-used K rows    = 15
-used C rows    = 15
-nonzeros       = 45
-```
-
-The final postprocess uses the same function-column mapping and odd-function
-multiplication by `x` as WMMA.
-
-## Full benchmark sweep and CSV
-
-Run all single, dual, triple, and quad cases:
+The benchmark script now includes `sparse_tc`:
 
 ```bash
 bash scripts/run_benchmarks.sh
 ```
 
-The default sweep uses `N=10000000`, one measured iteration, three terms, and a
-stress count of 2000. Override settings with environment variables:
+Override experiment settings with environment variables:
 
 ```bash
 N=10000000 ITERATIONS=3 PROFILE_SECTIONS=1 \
@@ -350,85 +418,15 @@ Results are written to:
 results/benchmark_results.csv
 ```
 
-The CSV includes timing, throughput, mandatory validation results, and the
-additional cuSPARSE/WMMA parity results.
-
-## Plotting
-
-```bash
-python3 scripts/plot_results.py \
-  results/benchmark_results.csv \
-  --outdir results/plots
-```
-
-The script plots successful SP, SFU, Tensor Core, and cuSPARSE rows. Unsupported
-SFU cases and validation failures are listed in `status_summary.txt`.
-
-## Section profiling
-
-Add:
-
-```bash
---profile-sections
-```
-
-For cuSPARSE this reports:
-
-- power-matrix construction and C initialization
-- the single algebraically scaled SpMM
-- postprocessing
-
-The profile pass is separate from the main latency measurement.
-
-## Meaning of `N`
-
-`N` is the number of input values in one benchmark iteration. For three
-functions and `N=10000000`, one iteration produces:
+## Source files relevant to the new engine
 
 ```text
-3 * 10000000 = 30000000 function outputs
+src/sparse_tc_engine.cu     direct mma.sp implementation
+include/tact/common.cuh     engine enum
+include/tact/engines.cuh    engine factory declaration
+src/common.cu               CLI parsing and layout rules
+src/runner.cu               engine selection and WMMA parity validation
+src/main.cu                 result reporting
+CMakeLists.txt              source registration and per-file -O3
+README.md                   commands and design notes
 ```
-
-Approximate major allocations for the triple case include:
-
-- input: 40 MB
-- output: 120 MB
-- cuSPARSE power matrix: about 60 MB
-- cuSPARSE result matrix: about 120 MB
-
-Host-side validation also stores output and reference arrays. Keep sufficient
-system RAM as well as GPU memory available.
-
-## Debugging
-
-Use a small `N` with `--debug`:
-
-```bash
-./build/tact_bench \
-  --engine cusparse \
-  --layout csr \
-  --functions sin,cos,tan \
-  --terms 3 \
-  --n 64 \
-  --iterations 1 \
-  --stress-repeat 2000 \
-  --threshold 5e-3 \
-  --min -0.78539816339 \
-  --max 0.78539816339 \
-  --debug \
-  --debug-values 8 \
-  --debug-rows 2
-```
-
-The debug dump includes the logical power matrix, coefficient matrix, expected
-intermediate values, CSR metadata, final outputs, and validation errors.
-
-## Notes
-
-- Use `terms=3` for direct compatibility with the reference cosine and triple
-  TACT kernels.
-- Taylor accuracy depends on term count and input range.
-- Tangent error grows on wider intervals.
-- cuSPARSE uses `CUSPARSE_SPMM_CSR_ALG2` with row-major dense matrices.
-- Increase `--iterations` only after the one-iteration commands pass mandatory
-  validation.

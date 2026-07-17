@@ -5,11 +5,12 @@ import math
 from pathlib import Path
 
 
-METHOD_ORDER = ["SP", "SFU", "Tensor Core", "cuSPARSE"]
+METHOD_ORDER = ["SP", "SFU", "Tensor Core", "Sparse Tensor Core PTX", "cuSPARSE"]
 METHOD_COLORS = {
     "SP": "#777777",
     "SFU": "#4c78a8",
     "Tensor Core": "#f58518",
+    "Sparse Tensor Core PTX": "#b279a2",
     "cuSPARSE": "#54a24b",
 }
 

@@ -123,9 +123,12 @@ static void dumpDebug(std::ostream& os,
     buildCoefficientCsrTranspose(
         coefficients.logical, used_output_rows, used_k,
         row_ptr, col_ind, values_csr);
-    os << "cuSPARSE shape: CSR(B^T)=" << used_output_rows << 'x'
-       << used_k << ", A^T=" << used_k << 'x'
-       << ((opt.n + spec.ipr - 1) / spec.ipr) << '\n';
+    const int packed_rows = (opt.n + spec.ipr - 1) / spec.ipr;
+    const int rows_pad = roundUp(packed_rows, WMMA_M);
+    const int tile_count = rows_pad / WMMA_M;
+    os << "cuSPARSE shape: CSR(B^T)=16x16, wide A^T/C^T=16x"
+       << rows_pad << "; every consecutive 16 columns are one of "
+       << tile_count << " independent WMMA-equivalent tiles\n";
     os << "cuSPARSE CSR row_ptr:";
     for (int value : row_ptr) os << ' ' << value;
     os << "\ncuSPARSE CSR nonzeros (column:value):";
@@ -168,6 +171,7 @@ static std::unique_ptr<Engine> makeSelectedEngine(
     case ENGINE_SP: return makeSpEngine(context);
     case ENGINE_WMMA: return makeWmmaEngine(context);
     case ENGINE_CUSPARSE: return makeCuSparseEngine(context);
+    case ENGINE_SPARSE_TC: return makeSparseTensorCoreEngine(context);
   }
   throw std::runtime_error("Unknown engine");
 }
@@ -364,10 +368,11 @@ RunResult runBenchmark(const Options& opt) {
   result.func_max_rel = std::move(validation.func_max_rel);
   result.func_failures = std::move(validation.func_failures);
 
-  // cuSPARSE gets a second, independent full-output parity gate against the
-  // already trusted WMMA backend. This catches coefficient/CSR/layout errors
-  // even when a host reference bug would affect both expected values.
-  if (opt.engine == ENGINE_CUSPARSE) {
+  // Sparse matrix engines get a second, independent full-output parity gate
+  // against the already trusted WMMA backend.  For sparse_tc this also
+  // catches PTX fragment-layout or metadata mistakes.
+  if (opt.engine == ENGINE_CUSPARSE ||
+      opt.engine == ENGINE_SPARSE_TC) {
     Options wmma_options = opt;
     wmma_options.engine = ENGINE_WMMA;
     wmma_options.layout = LAYOUT_DENSE;

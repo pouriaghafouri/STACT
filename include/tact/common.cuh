@@ -83,7 +83,8 @@ enum EngineKind : int {
   ENGINE_SFU = 0,
   ENGINE_SP = 1,
   ENGINE_WMMA = 2,
-  ENGINE_CUSPARSE = 3
+  ENGINE_CUSPARSE = 3,
+  ENGINE_SPARSE_TC = 4
 };
 
 struct Options {

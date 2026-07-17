@@ -31,6 +31,7 @@ std::string engineName(EngineKind e) {
     case ENGINE_SP: return "sp";
     case ENGINE_WMMA: return "wmma";
     case ENGINE_CUSPARSE: return "cusparse";
+    case ENGINE_SPARSE_TC: return "sparse_tc";
   }
   return "unknown";
 }
@@ -77,6 +78,10 @@ EngineKind parseEngine(const std::string& raw) {
   if (s == "sp" || s == "libdevice" || s == "baseline_sp") return ENGINE_SP;
   if (s == "wmma" || s == "tensor" || s == "dense") return ENGINE_WMMA;
   if (s == "cusparse") return ENGINE_CUSPARSE;
+  if (s == "sparse_tc" || s == "sparse-tc" ||
+      s == "custom_sparse" || s == "mma_sp") {
+    return ENGINE_SPARSE_TC;
+  }
   throw std::runtime_error("Unknown engine: " + raw);
 }
 
@@ -204,7 +209,8 @@ std::vector<float> makeInputs(const Options& opt, BasisKind basis) {
   if (!opt.min_set && !opt.max_set) {
     std::vector<float> h(opt.n);
     bool matrix_engine = opt.engine == ENGINE_WMMA ||
-                         opt.engine == ENGINE_CUSPARSE;
+                         opt.engine == ENGINE_CUSPARSE ||
+                         opt.engine == ENGINE_SPARSE_TC;
     if (matrix_engine) {
       // TACT matrix engines use the Tensor Core reference initialization.
       std::fill(h.begin(), h.end(), opt.funcs.size() == 1 ? 5.0f : 1.0f);
@@ -332,7 +338,7 @@ Options parseArgs(int argc, char** argv) {
     } else if (a == "--help" || a == "-h") {
       std::cout <<
         "TACT benchmark (original stress workload only)\n"
-        "  --engine sfu|sp|wmma|cusparse\n"
+        "  --engine sfu|sp|wmma|cusparse|sparse_tc\n"
         "  --functions cos | sin,cos | sin,cos,tan | sin,cos,tan,sinh\n"
         "  --terms <1..8> --layout dense|csr\n"
         "  --n <count> --warmup <k> --iterations <k>\n"
@@ -368,7 +374,8 @@ Options parseArgs(int argc, char** argv) {
       throw std::runtime_error("cuSPARSE requires --layout csr.");
     }
   } else if (opt.layout != LAYOUT_DENSE) {
-    throw std::runtime_error("SP, SFU, and WMMA require --layout dense.");
+    throw std::runtime_error(
+        "SP, SFU, WMMA, and sparse_tc require --layout dense.");
   }
 
   const bool single = opt.funcs == std::vector<FunctionId>{F_COS};
